@@ -1,0 +1,45 @@
+name: Build iOS ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build Vue Frontend
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: Cross-Compile for iOS ARM64
+        env:
+          CGO_ENABLED: 1
+          GOOS: ios
+          GOARCH: arm64
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC_PATH=$(xcrun --sdk iphoneos --find clang)
+          export CC="$CC_PATH -arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=16.0"
+          export CXX="$CC_PATH++ -arch arm64 -isysroot $SDK_PATH -miphoneos-version-min=16.0"
+          go build -trimpath -o aistudio2api ./cmd/aistudio2api
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aistudio2api-ios-arm64
+          path: aistudio2api
