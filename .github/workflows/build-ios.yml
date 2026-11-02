@@ -1,6 +1,9 @@
 name: Build iOS ARM64
 
 on:
+  push:
+    branches:
+      - 'feat/**'
   workflow_dispatch:
 
 jobs:

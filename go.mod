@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/Mag1cFall/fhttp v0.6.8-firefox.1
 	github.com/Mag1cFall/go-sentencepiece v0.7.1
+	github.com/Mag1cFall/goja v0.0.0-firefox.2
 	github.com/Mag1cFall/uquic v0.0.6-firefox.6
 	github.com/Mag1cFall/utls v1.8.2-firefox.3
 	github.com/bogdanfinn/fhttp v0.6.8
@@ -25,6 +26,7 @@ require (
 	github.com/oov/audio v0.0.0-20171004131523-88a2be6dbe38
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/shirou/gopsutil/v4 v4.26.9
+	github.com/tetratelabs/wazero v1.12.0
 	github.com/thesyncim/gopus v0.1.2
 	github.com/tphakala/go-aac v0.7.0
 	github.com/tphakala/go-mp3 v0.1.0
@@ -51,7 +53,9 @@ require (
 	github.com/coder/websocket v1.8.14 // indirect
 	github.com/ebitengine/purego v0.11.1 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
+	github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 // indirect
 	github.com/icza/bitio v1.1.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect

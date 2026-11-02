@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -143,6 +144,10 @@ type Config struct {
 
 // Default 返回可直接启动的默认配置
 func Default() Config {
+	waaBackend := WAABackendCamoufox
+	if runtime.GOOS == "ios" {
+		waaBackend = WAABackendSpiderMonkey
+	}
 	return Config{
 		AdminUsername:          "admin",
 		LogFile:                true,
@@ -165,7 +170,7 @@ func Default() Config {
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		RoutingStrategy:        "round-robin",
 		UpstreamChannels:       []string{"playground"},
-		WAABackend:             WAABackendCamoufox,
+		WAABackend:             waaBackend,
 		MediaOutput:            MediaOutputInline,
 	}
 }
@@ -222,9 +227,15 @@ var configSetters = map[string]func(*Config, string) error{
 	"ROUTING_STRATEGY":         textSetter(func(c *Config) *string { return &c.RoutingStrategy }, strings.TrimSpace),
 	"MODEL_MAPPING":            textSetter(func(c *Config) *string { return &c.ModelMapping }, strings.TrimSpace),
 	"MODEL_CHANNELS":           textSetter(func(c *Config) *string { return &c.ModelChannels }, strings.TrimSpace),
-	"API_KEY_ACCOUNTS":         textSetter(func(c *Config) *string { return &c.APIKeyAccounts }, strings.TrimSpace),
-	"WAA_BACKEND":              textSetter(func(c *Config) *string { return &c.WAABackend }, lowerTrim),
-	"MEDIA_OUTPUT":             textSetter(func(c *Config) *string { return &c.MediaOutput }, lowerTrim),
+	"API_KEY_ACCOUNTS": textSetter(func(c *Config) *string { return &c.APIKeyAccounts }, strings.TrimSpace),
+	"WAA_BACKEND": textSetter(func(c *Config) *string { return &c.WAABackend }, func(value string) string {
+		v := lowerTrim(value)
+		if runtime.GOOS == "ios" && v == "go" {
+			return WAABackendSpiderMonkey
+		}
+		return v
+	}),
+	"MEDIA_OUTPUT":   textSetter(func(c *Config) *string { return &c.MediaOutput }, lowerTrim),
 	"MEDIA_BASE_URL":           textSetter(func(c *Config) *string { return &c.MediaBaseURL }, strings.TrimSpace),
 	"UPSTREAM_CHANNELS": func(c *Config, value string) error {
 		c.UpstreamChannels = parseUpstreamChannels(value)

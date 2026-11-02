@@ -16,7 +16,6 @@ concurrency:
 
 env:
   GOTOOLCHAIN: local
-  SPIDERMONKEY: v152.0.4-aistudio2api.1
 
 jobs:
   frontend:
@@ -82,9 +81,6 @@ jobs:
             ~/.cache/go-build
           key: go-checks-${{ matrix.check }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: go-checks-${{ matrix.check }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-      - uses: ./.github/actions/spidermonkey
-        with:
-          target: linux-amd64-gnu
       - name: Run Unit Tests
         if: matrix.check == 'test'
         run: go test -mod=readonly -trimpath -vet=off ./cmd/... ./internal/...
@@ -99,10 +95,6 @@ jobs:
         run: |
           curl -fsSL https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz | tar -xJ -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
-      - uses: ./.github/actions/spidermonkey
-        if: matrix.check == 'vet'
-        with:
-          target: windows-amd64
       - name: Vet Windows Build
         if: matrix.check == 'vet'
         run: CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ GOOS=windows go vet -mod=readonly -trimpath -tags desktop,production ./...
@@ -147,9 +139,6 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - uses: ./.github/actions/spidermonkey
-        with:
-          target: linux-${{ matrix.arch }}
       - name: Build Packages
         shell: bash
         env:
@@ -205,9 +194,6 @@ jobs:
         run: |
           curl -fsSL https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz | tar -xJ -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64/bin" >> "$GITHUB_PATH"
-      - uses: ./.github/actions/spidermonkey
-        with:
-          target: windows-amd64
       - name: Build Package
         shell: bash
         run: |
@@ -257,12 +243,6 @@ jobs:
             ~/Library/Caches/go-build
           key: go-macos-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: go-macos-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
-      - uses: ./.github/actions/spidermonkey
-        with:
-          target: darwin-arm64
-      - uses: ./.github/actions/spidermonkey
-        with:
-          target: darwin-amd64
       - name: Build App
         shell: bash
         env:
@@ -277,8 +257,8 @@ jobs:
           mkdir -p dist
           build() {
             export GOARCH=$1
-            export CGO_CXXFLAGS="-mmacosx-version-min=12.0 -I$RUNNER_TEMP/spidermonkey/darwin-$1/include"
-            export CGO_LDFLAGS="-mmacosx-version-min=12.0 -L$RUNNER_TEMP/spidermonkey/darwin-$1/lib"
+            export CGO_CXXFLAGS="-mmacosx-version-min=12.0"
+            export CGO_LDFLAGS="-mmacosx-version-min=12.0"
             go build -mod=readonly -trimpath -tags desktop,production -ldflags="-s -w $link" -o "dist/aistudio2api-$1" ./cmd/aistudio2api
             name="aistudio2api-${version}-darwin-$1"
             mkdir -p "dist/$name"
@@ -349,9 +329,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config file libgtk-4-dev libwebkitgtk-6.0-dev
-      - uses: ./.github/actions/spidermonkey
-        with:
-          target: linux-amd64-gnu
       - name: Build Packages
         shell: bash
         run: |
