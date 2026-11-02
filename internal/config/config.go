@@ -415,10 +415,12 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg := Default()
-	for _, key := range configKeys {
-		if value, ok := os.LookupEnv(key); ok {
-			values[key] = value
-			cfg.Environment = append(cfg.Environment, key)
+	if runtime.GOOS != "ios" {
+		for _, key := range configKeys {
+			if value, ok := os.LookupEnv(key); ok {
+				values[key] = value
+				cfg.Environment = append(cfg.Environment, key)
+			}
 		}
 	}
 	for _, key := range configKeys {
