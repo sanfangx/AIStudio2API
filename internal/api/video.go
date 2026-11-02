@@ -57,41 +57,11 @@ type geminiVideoInlineData struct {
 	Data          string `json:"data"`
 }
 
-func (b *geminiVideoInlineData) MIME() string {
-	if b == nil {
-		return ""
-	}
-	if b.MIMEType != "" {
-		return b.MIMEType
-	}
-	return b.MIMETypeSnake
-}
-
 type geminiVideoFileData struct {
 	MIMEType      string `json:"mimeType"`
 	MIMETypeSnake string `json:"mime_type"`
 	FileURI       string `json:"fileUri"`
 	FileURISnake  string `json:"file_uri"`
-}
-
-func (f *geminiVideoFileData) MIME() string {
-	if f == nil {
-		return ""
-	}
-	if f.MIMEType != "" {
-		return f.MIMEType
-	}
-	return f.MIMETypeSnake
-}
-
-func (f *geminiVideoFileData) URI() string {
-	if f == nil {
-		return ""
-	}
-	if f.FileURI != "" {
-		return f.FileURI
-	}
-	return f.FileURISnake
 }
 
 type openAIVideoRequest struct {
@@ -113,20 +83,23 @@ func (s *server) handleGeminiVideoCreate(w http.ResponseWriter, r *http.Request,
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
-	videoRequest, count, err := request.toVideoRequest(model)
+	videoRequests, count, err := request.toVideoRequests(model)
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
-	videoRequest = normalizeVideoDefaults(videoRequest)
-	ids := make([]string, 0, count)
-	for range count {
-		operation, createErr := service.GenerateVideo(r.Context(), videoRequest)
-		if createErr != nil {
-			err = createErr
-			break
+	ids := make([]string, 0, count*len(videoRequests))
+create:
+	for _, videoRequest := range videoRequests {
+		videoRequest = normalizeVideoDefaults(videoRequest)
+		for range count {
+			operation, createErr := service.GenerateVideo(r.Context(), videoRequest)
+			if createErr != nil {
+				err = createErr
+				break create
+			}
+			ids = append(ids, operation.ID)
 		}
-		ids = append(ids, operation.ID)
 	}
 	if len(ids) == 0 {
 		if shouldWriteRequestError(r, err) {
@@ -143,10 +116,10 @@ const maxVideoCount = 4
 // videoOperationSeparator 连接同一 Gemini 操作内各上游视频任务的 ID
 const videoOperationSeparator = "~"
 
-// toVideoRequest 返回单个上游视频任务的请求与要创建的任务数
-func (request geminiVideoRequest) toVideoRequest(model string) (aistudio.VideoRequest, int, error) {
-	if len(request.Instances) != 1 {
-		return aistudio.VideoRequest{}, 0, fmt.Errorf("instances must contain one instance")
+// toVideoRequests 返回每个 instance 的上游视频任务请求与每个 instance 要创建的任务数
+func (request geminiVideoRequest) toVideoRequests(model string) ([]aistudio.VideoRequest, int, error) {
+	if len(request.Instances) == 0 {
+		return nil, 0, fmt.Errorf("instances is required")
 	}
 	count := request.Parameters.NumberOfVideos
 	if count == 0 {
@@ -156,53 +129,56 @@ func (request geminiVideoRequest) toVideoRequest(model string) (aistudio.VideoRe
 		count = 1
 	}
 	if count < 1 || count > maxVideoCount {
-		return aistudio.VideoRequest{}, 0, fmt.Errorf("numberOfVideos must be between 1 and %d", maxVideoCount)
+		return nil, 0, fmt.Errorf("numberOfVideos must be between 1 and %d", maxVideoCount)
 	}
 	duration, err := videoDuration(request.Parameters.Duration)
 	if err != nil {
-		return aistudio.VideoRequest{}, 0, err
+		return nil, 0, err
 	}
-	instance := request.Instances[0]
 	negative := request.Parameters.NegativePrompt
 	if negative == "" {
 		negative = request.Parameters.NegativePromptSnake
 	}
-	result := aistudio.VideoRequest{
-		Model: model, Prompt: instance.Prompt, NegativePrompt: negative,
-		AspectRatio: request.Parameters.AspectRatio, DurationSeconds: duration, Resolution: request.Parameters.Resolution,
-	}
-	if instance.Image != nil {
-		if result.StartImage, err = geminiVideoImage(instance.Image); err != nil {
-			return aistudio.VideoRequest{}, 0, fmt.Errorf("image: %w", err)
+	results := make([]aistudio.VideoRequest, 0, len(request.Instances))
+	for index, instance := range request.Instances {
+		result := aistudio.VideoRequest{
+			Model: model, Prompt: instance.Prompt, NegativePrompt: negative,
+			AspectRatio: request.Parameters.AspectRatio, DurationSeconds: duration, Resolution: request.Parameters.Resolution,
 		}
-	}
-	last := instance.LastFrame
-	if last == nil {
-		last = instance.LastFrameSnake
-	}
-	if last != nil {
-		if result.LastImage, err = geminiVideoImage(last); err != nil {
-			return aistudio.VideoRequest{}, 0, fmt.Errorf("lastFrame: %w", err)
+		if instance.Image != nil {
+			if result.StartImage, err = geminiVideoImage(instance.Image); err != nil {
+				return nil, 0, fmt.Errorf("instances[%d].image: %w", index, err)
+			}
 		}
-	}
-	references := instance.ReferenceImages
-	if references == nil {
-		references = instance.ReferenceImagesSnake
-	}
-	for index, reference := range references {
-		if reference.Image == nil {
-			return aistudio.VideoRequest{}, 0, fmt.Errorf("referenceImages[%d].image is required", index)
+		last := instance.LastFrame
+		if last == nil {
+			last = instance.LastFrameSnake
 		}
-		image, err := geminiVideoImage(reference.Image)
-		if err != nil {
-			return aistudio.VideoRequest{}, 0, fmt.Errorf("referenceImages[%d].image: %w", index, err)
+		if last != nil {
+			if result.LastImage, err = geminiVideoImage(last); err != nil {
+				return nil, 0, fmt.Errorf("instances[%d].lastFrame: %w", index, err)
+			}
 		}
-		result.ReferenceImages = append(result.ReferenceImages, image)
+		references := instance.ReferenceImages
+		if references == nil {
+			references = instance.ReferenceImagesSnake
+		}
+		for reference, item := range references {
+			if item.Image == nil {
+				return nil, 0, fmt.Errorf("instances[%d].referenceImages[%d].image is required", index, reference)
+			}
+			image, err := geminiVideoImage(item.Image)
+			if err != nil {
+				return nil, 0, fmt.Errorf("instances[%d].referenceImages[%d].image: %w", index, reference, err)
+			}
+			result.ReferenceImages = append(result.ReferenceImages, image)
+		}
+		if strings.TrimSpace(result.Prompt) == "" && result.StartImage == nil && result.LastImage == nil && len(result.ReferenceImages) == 0 {
+			return nil, 0, fmt.Errorf("instances[%d] must contain a prompt or an image", index)
+		}
+		results = append(results, result)
 	}
-	if strings.TrimSpace(result.Prompt) == "" && result.StartImage == nil && result.LastImage == nil && len(result.ReferenceImages) == 0 {
-		return aistudio.VideoRequest{}, 0, fmt.Errorf("instances[0] must contain a prompt or an image")
-	}
-	return result, count, nil
+	return results, count, nil
 }
 
 func geminiVideoImage(input *geminiVideoImageInput) (*aistudio.VideoImage, error) {
@@ -224,25 +200,25 @@ func geminiVideoImage(input *geminiVideoImageInput) (*aistudio.VideoImage, error
 		return nil, fmt.Errorf("image must contain exactly one of bytesBase64Encoded, inlineData or fileData")
 	}
 	if inline != nil {
-		mime := inline.MIME()
-		if mime == "" || inline.Data == "" {
+		mimeType := cmp.Or(inline.MIMEType, inline.MIMETypeSnake)
+		if mimeType == "" || inline.Data == "" {
 			return nil, fmt.Errorf("image requires mimeType and data")
 		}
 		data, err := decodeBase64Flexible(inline.Data)
 		if err != nil {
 			return nil, fmt.Errorf("image.inlineData.data: %w", err)
 		}
-		mimeType, data := normalizeImagePayload(mime, data)
+		mimeType, data = normalizeImagePayload(mimeType, data)
 		return &aistudio.VideoImage{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}}, nil
 	}
 	if file != nil {
-		return &aistudio.VideoImage{File: &aistudio.FileRef{ID: file.URI(), MIME: file.MIME()}}, nil
+		return &aistudio.VideoImage{File: &aistudio.FileRef{ID: cmp.Or(file.FileURI, file.FileURISnake), MIME: cmp.Or(file.MIMEType, file.MIMETypeSnake)}}, nil
 	}
 	return nil, fmt.Errorf("image requires bytesBase64Encoded, inlineData or fileData")
 }
 
 func videoDuration(raw json.RawMessage) (int, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	if !rawJSONConfigured(raw) {
 		return 0, nil
 	}
 	var value string
@@ -563,21 +539,9 @@ func (s *server) handleOpenAIVideoContent(w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
-	mimeType := media.MIME
-	if mimeType == "" {
-		mimeType = "video/mp4"
-	}
-	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Type", cmp.Or(media.MIME, "video/mp4"))
 	w.Header().Set("Content-Disposition", `attachment; filename="video.mp4"`)
-	if media.Size >= 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(media.Size, 10))
-	}
-	w.WriteHeader(http.StatusOK)
-	_, copyErr := io.Copy(w, media.Body)
-	closeErr := media.Body.Close()
-	if requestErr := errors.Join(copyErr, closeErr); requestErr != nil {
-		SetAccessLogError(r.Context(), requestErr)
-	}
+	writeMediaStream(w, r, media.Body, media.Size)
 }
 
 func cleanOperationID(value string) string {

@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
+import { computed, onActivated, onDeactivated, ref, shallowRef, watch } from 'vue'
 import { api } from '@/api'
 import { useI18n } from '@/i18n'
 import type { Model, UsageDimension, UsageReport, UsageStats } from '@/types'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
-import FilterMenu from './usage/FilterMenu.vue'
+import FilterMenu from './FilterMenu.vue'
 import KpiCard from './usage/KpiCard.vue'
 import RangePicker from './usage/RangePicker.vue'
 import RankingTable from './usage/RankingTable.vue'
@@ -131,12 +131,13 @@ function resume(): void {
   if (document.visibilityState === 'visible') tick()
 }
 
-onMounted(() => {
-  void load()
+onActivated(() => {
+  if (report.value === null) void load()
+  else tick()
   clockTimer = window.setInterval(tick, 1000)
   document.addEventListener('visibilitychange', resume)
 })
-onUnmounted(() => {
+onDeactivated(() => {
   controller?.abort()
   window.clearInterval(clockTimer)
   document.removeEventListener('visibilitychange', resume)
@@ -406,6 +407,9 @@ const statusOptions = computed(() =>
         :options="filterOptions(dimension)"
         :selected="state.filters[dimension] ?? []"
         :format="(value: string) => dimensionLabel(dimension, value)"
+        :search-label="t('usage.filterSearch')"
+        :empty-label="t('usage.filterNone')"
+        :clear-label="t('usage.filtersClear')"
         @change="setFilter(dimension, $event)"
       />
       <button
