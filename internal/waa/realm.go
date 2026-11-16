@@ -1,6 +1,7 @@
 package waa
 
 import (
+	"bytes"
 	cryptorand "crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mag1cFall/goja"
 	"golang.org/x/text/encoding"
@@ -180,6 +182,7 @@ func newIframeWindow(parent *goja.Runtime, state *hostState) (*goja.Object, erro
 		return nil, err
 	}
 	child.SetRandSource(source)
+	child.SetTimeSource(state.loop.wall)
 	if _, err := state.installRealmHost(child, "frame", nil); err != nil {
 		return nil, err
 	}
@@ -397,8 +400,14 @@ func decodeText(name string, data []byte, fatal bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if fatal && strings.ContainsRune(string(decoded), '�') && !strings.ContainsRune(string(data), '�') {
+	if fatal && bytes.ContainsRune(decoded, utf8.RuneError) && !reencodes(encoder, decoded, data) {
 		return "", encoding.ErrInvalidUTF8
 	}
 	return string(decoded), nil
+}
+
+// reencodes 判断 decoded 按该编码重新编码后与 data 逐字节相同，此时其中的 U+FFFD 都来自合法编码的 U+FFFD
+func reencodes(encoder encoding.Encoding, decoded, data []byte) bool {
+	encoded, err := encoder.NewEncoder().Bytes(decoded)
+	return err == nil && bytes.Equal(encoded, data)
 }

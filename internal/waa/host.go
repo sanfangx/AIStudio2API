@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	cryptorand "crypto/rand"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,7 @@ import (
 //go:embed dom.js
 var domJavaScript string
 
-//go:embed firefox152.json.gz
+//go:embed firefox158.json.gz
 var firefoxShapeGzip []byte
 
 // gunzip 解压内嵌的 gzip 数据
@@ -40,6 +41,120 @@ var firefoxShapeJSON = sync.OnceValues(func() (string, error) {
 	return string(data), err
 })
 
+// shapeTable 是进程内准备一次、各 VM 共用的只读形状表：parts 为把 defaults 换成空对象、各接口的 pr 换成成员名与种类 pk 后在 Closure 监听表全局名处切开的各段，各 VM 以自己的随机名拼回；defaults 与 members 为各接口默认值与原型成员的 JSON，names 为 defaults 的接口名按原顺序的 JSON 数组，各 VM 只在首次读取某接口的这两项时解析它
+type shapeTable struct {
+	parts    []string
+	names    string
+	defaults map[string]string
+	members  map[string]string
+}
+
+// firefoxShape 从内嵌的 Firefox 形状表准备 shapeTable
+var firefoxShape = sync.OnceValues(func() (*shapeTable, error) {
+	shape, err := firefoxShapeJSON()
+	if err != nil {
+		return nil, err
+	}
+	table := &shapeTable{defaults: map[string]string{}, members: map[string]string{}}
+	var text strings.Builder
+	last := 0
+	decoder := json.NewDecoder(strings.NewReader(shape))
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		var replaced string
+		switch key {
+		case "defaults":
+			replaced, err = "{}", table.splitDefaults(value)
+		case "interfaces":
+			replaced, err = table.splitMembers(value)
+		default:
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		end := int(decoder.InputOffset())
+		text.WriteString(shape[last : end-len(value)])
+		text.WriteString(replaced)
+		last = end
+	}
+	text.WriteString(shape[last:])
+	table.parts = closureListenerMapPattern.Split(text.String(), -1)
+	return table, nil
+})
+
+// splitDefaults 把各接口默认值按接口名移入 defaults，并按原顺序记下接口名
+func (table *shapeTable) splitDefaults(value json.RawMessage) error {
+	entries := json.NewDecoder(bytes.NewReader(value))
+	if _, err := entries.Token(); err != nil {
+		return err
+	}
+	var names []string
+	for entries.More() {
+		name, err := entries.Token()
+		if err != nil {
+			return err
+		}
+		var entry json.RawMessage
+		if err := entries.Decode(&entry); err != nil {
+			return err
+		}
+		names = append(names, name.(string))
+		table.defaults[name.(string)] = string(entry)
+	}
+	encoded, err := json.Marshal(names)
+	table.names = string(encoded)
+	return err
+}
+
+// splitMembers 把接口表中各接口的 pr 按接口名移入 members，原处换成成员名与种类的 pk，有 entries 成对迭代器的接口记 pi，返回改写后的接口表 JSON
+func (table *shapeTable) splitMembers(value json.RawMessage) (string, error) {
+	var interfaces []map[string]json.RawMessage
+	if err := json.Unmarshal(value, &interfaces); err != nil {
+		return "", err
+	}
+	for _, info := range interfaces {
+		var name string
+		if err := json.Unmarshal(info["n"], &name); err != nil {
+			return "", err
+		}
+		var members []struct {
+			N  string `json:"n"`
+			K  string `json:"k"`
+			Fn string `json:"fn"`
+		}
+		if err := json.Unmarshal(info["pr"], &members); err != nil {
+			return "", err
+		}
+		keys := make([][2]string, len(members))
+		for index, member := range members {
+			keys[index] = [2]string{member.N, member.K}
+			if member.N == "@@iterator" && member.Fn == "entries" {
+				info["pi"] = json.RawMessage("true")
+			}
+		}
+		encoded, err := json.Marshal(keys)
+		if err != nil {
+			return "", err
+		}
+		table.members[name] = string(info["pr"])
+		info["pk"] = encoded
+		delete(info, "pr")
+	}
+	encoded, err := json.Marshal(interfaces)
+	return string(encoded), err
+}
+
 // Profile 保存账户指纹与页面状态决定的宿主现场值
 type Profile struct {
 	PageURL      string
@@ -56,6 +171,12 @@ type Profile struct {
 	TrustedTypes bool
 	// NavigationStart 是页面导航开始的时间，为零时页面时间起点取宿主安装时刻
 	NavigationStart time.Time
+	// Navigation 是顶层页面 PerformanceNavigationTiming 的取值，以导航开始为零点的毫秒数
+	Navigation map[string]any
+	// DOMLoading 是顶层页面旧版 performance.timing.domLoading 相对导航开始的毫秒数
+	DOMLoading int
+	// MediaInputs 是页面未授权时 enumerateDevices 列出的输入设备种类，按 audioinput、videoinput 顺序
+	MediaInputs []string
 }
 
 // closureListenerMapPattern 匹配 Closure 事件库在页面载入时以随机数命名的监听表全局名
@@ -66,12 +187,14 @@ var frameWindowNames = []string{"outerWidth", "outerHeight", "screenX", "screenY
 
 // hostState 保存同一 agent 内各 Realm 共享的宿主数据
 type hostState struct {
+	loop       *eventLoop
 	registry   *hostRegistry
 	rejections *rejectionQueue
 	profile    Profile
 	loadImage  func(string) bool
-	pending    *sync.WaitGroup
-	schedule   func(time.Duration, func())
+	loadFrame  func(string) bool
+	pending    int
+	settled    []chan struct{}
 	location   *time.Location
 	zoneName   func(time.Time) string
 	shape      goja.Value
@@ -81,9 +204,44 @@ type hostState struct {
 	topAPI     goja.Value
 }
 
+// loaded 结束一个页面资源请求，没有进行中的请求时唤醒等待静置的调用方
+func (state *hostState) loaded() {
+	state.pending--
+	if state.pending > 0 {
+		return
+	}
+	for _, done := range state.settled {
+		close(done)
+	}
+	state.settled = nil
+}
+
 // hostJavaScript 为一个 Realm 安装 Function.prototype.toString、计时器与 Firefox DOM
 const hostJavaScript = `
 (input => {
+  if (input.shapeDefaults) {
+    const parseJSON = JSON.parse;
+    const defineProperty = Object.defineProperty;
+    const shapeEntry = input.shapeEntry;
+    const defaults = input.shape.defaults;
+    for (const name of parseJSON(input.shapeDefaults)) {
+      defineProperty(defaults, name, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const value = parseJSON(shapeEntry('defaults', name));
+          defineProperty(defaults, name, { configurable: true, enumerable: true, writable: true, value });
+          return value;
+        },
+      });
+    }
+    const members = new Map();
+    input.shape.members = name => {
+      let value = members.get(name);
+      if (!value) members.set(name, value = parseJSON(shapeEntry('pr', name)));
+      return value;
+    };
+  }
   const markNative = input.markNative;
   const nativeSourceOf = input.nativeSource;
   const originalFunctionToString = Function.prototype.toString;
@@ -155,9 +313,11 @@ const hostJavaScript = `
     templatedObject: input.templatedObject,
     setTemplateResolver: input.setTemplateResolver,
     performanceNow: input.performanceNow,
+    inputNow: input.inputNow,
     timeOrigin: input.timeOrigin,
     createIframeWindow: input.createIframeWindow,
     loadImage: input.loadImage,
+    loadFrame: input.loadFrame,
     resolveInterface: input.resolveInterface,
     orderKeys: input.orderKeys,
     intl: input.intl,
@@ -216,12 +376,13 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 	if !ok {
 		return nil, errors.New("WAA Realm 宿主不是函数")
 	}
+	input := vm.NewObject()
 	if state.shape == nil {
-		shapeJSON, err := firefoxShapeJSON()
+		shape, err := firefoxShape()
 		if err != nil {
 			return nil, fmt.Errorf("读取 Firefox 形状表: %w", err)
 		}
-		shapeJSON = closureListenerMapPattern.ReplaceAllLiteralString(shapeJSON, "closure_lm_"+strconv.Itoa(rand.IntN(1000000)))
+		shapeJSON := strings.Join(shape.parts, "closure_lm_"+strconv.Itoa(rand.IntN(1000000)))
 		parse, _ := goja.AssertFunction(vm.Get("JSON").ToObject(vm).Get("parse"))
 		state.shape, err = parse(goja.Undefined(), vm.ToValue(shapeJSON))
 		if err != nil {
@@ -237,8 +398,15 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 			return nil, err
 		}
 		state.storage = vm.NewObject()
+		_ = input.Set("shapeDefaults", shape.names)
+		_ = input.Set("shapeEntry", func(kind, name string) string {
+			if kind == "pr" {
+				return shape.members[name]
+			}
+			return shape.defaults[name]
+		})
 	}
-	timers := &realmTimers{vm: vm, schedule: state.schedule, active: make(map[int64]bool), registry: state.registry, trustedTypes: state.profile.TrustedTypes, report: reportError}
+	timers := &realmTimers{vm: vm, schedule: state.loop.schedule, active: make(map[int64]bool), registry: state.registry, trustedTypes: state.profile.TrustedTypes, report: reportError}
 	timerObject := vm.NewObject()
 	_ = timerObject.Set("setTimeout", func(call goja.FunctionCall) goja.Value { return timers.start(call, false) })
 	_ = timerObject.Set("setInterval", func(call goja.FunctionCall) goja.Value { return timers.start(call, true) })
@@ -246,7 +414,6 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 		delete(timers.active, call.Argument(0).ToInteger())
 		return goja.Undefined()
 	})
-	input := vm.NewObject()
 	_ = input.Set("markNative", func(call goja.FunctionCall) goja.Value {
 		if object, ok := call.Argument(0).(*goja.Object); ok {
 			state.registry.native[object] = call.Argument(1).String()
@@ -311,19 +478,24 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 	if state.zoneName != nil {
 		vm.SetTimeZoneName(state.zoneName)
 	}
-	realmStarted := time.Now()
+	wall := state.loop.wall()
+	realmStarted := wall
 	if realm == "top" && !state.profile.NavigationStart.IsZero() {
 		realmStarted = state.profile.NavigationStart
 	}
+	started := state.loop.now() - float64(wall.Sub(realmStarted).Microseconds())/1000
 	_ = input.Set("timeOrigin", float64(realmStarted.UnixMilli()))
 	_ = input.Set("performanceNow", func(goja.FunctionCall) goja.Value {
-		return vm.ToValue(math.Floor(float64(time.Since(realmStarted)) / float64(time.Millisecond)))
+		return vm.ToValue(math.Floor(state.loop.now() - started))
+	})
+	_ = input.Set("inputNow", func(goja.FunctionCall) goja.Value {
+		return vm.ToValue(math.Floor(state.loop.taskStarted() - started))
 	})
 	_ = input.Set("preciseNow", func(goja.FunctionCall) goja.Value {
-		return vm.ToValue(float64(time.Since(realmStarted).Microseconds()) / 1000)
+		return vm.ToValue(math.Floor((state.loop.now()-started)*1000) / 1000)
 	})
 	_ = input.Set("queueTask", func(delay float64, callback goja.Callable) {
-		state.schedule(time.Duration(max(delay, 0)*float64(time.Millisecond)), func() {
+		state.loop.schedule(time.Duration(max(delay, 0)*float64(time.Millisecond)), func() {
 			_, err := callback(goja.Undefined())
 			reportError(err)
 		})
@@ -409,11 +581,27 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 	}
 	if state.loadImage != nil {
 		_ = input.Set("loadImage", func(address string, callback goja.Callable) {
-			state.pending.Add(1)
+			state.pending++
 			go func() {
-				defer state.pending.Done()
 				loaded := state.loadImage(address)
-				state.schedule(0, func() { _, _ = callback(goja.Undefined(), vm.ToValue(loaded)) })
+				state.loop.post(func() {
+					_, err := callback(goja.Undefined(), vm.ToValue(loaded))
+					reportError(err)
+					state.loaded()
+				})
+			}()
+		})
+	}
+	if state.loadFrame != nil {
+		_ = input.Set("loadFrame", func(address string, callback goja.Callable) {
+			state.pending++
+			go func() {
+				loaded := state.loadFrame(address)
+				state.loop.post(func() {
+					_, err := callback(goja.Undefined(), vm.ToValue(loaded))
+					reportError(err)
+					state.loaded()
+				})
 			}()
 		})
 	}
@@ -473,6 +661,9 @@ func (state *hostState) realmProfile(realm string) map[string]any {
 		if width, ok := profile.Window["innerWidth"]; ok {
 			values["visualViewport"] = map[string]any{"width": width, "height": profile.Window["innerHeight"]}
 		}
+		if len(profile.Navigation) > 0 {
+			values["performance.navigationEntry"] = profile.Navigation
+		}
 	} else {
 		for _, name := range frameWindowNames {
 			if value, ok := profile.Window[name]; ok {
@@ -489,7 +680,12 @@ func (state *hostState) realmProfile(realm string) map[string]any {
 			values["document"] = document
 		}
 	}
-	result := map[string]any{"hasFocus": profile.HasFocus, "window": window, "values": values}
+	mediaInputs := make([]string, len(profile.MediaInputs))
+	copy(mediaInputs, profile.MediaInputs)
+	result := map[string]any{"hasFocus": profile.HasFocus, "window": window, "values": values, "mediaInputs": mediaInputs}
+	if realm == "top" && len(profile.Navigation) > 0 {
+		result["domLoading"] = profile.DOMLoading
+	}
 	if realm == "top" && len(profile.Globals) > 0 {
 		result["globals"] = profile.Globals
 	}

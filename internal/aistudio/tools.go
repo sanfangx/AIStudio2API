@@ -1,9 +1,14 @@
 package aistudio
 
 import (
+	"bytes"
+	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +30,7 @@ func encodeRequestedTools(tools Tools) ([]any, bool, error) {
 	if len(tools.Functions) > 0 {
 		declarations := make([]any, 0, len(tools.Functions))
 		for index, declaration := range tools.Functions {
+			declaration.Name = wireFunctionName(declaration.Name)
 			encoded, err := encodeFunctionDeclaration(declaration)
 			if err != nil {
 				return nil, false, fmt.Errorf("编码 function declaration %d: %w", index, err)
@@ -189,6 +195,42 @@ func functionBehavior(declaration FunctionDeclaration) (string, int64, error) {
 		return "", 0, fmt.Errorf("behavior %q 无效，可用 BLOCKING 或 NON_BLOCKING", declaration.Behavior)
 	}
 	return name, value, nil
+}
+
+// maxWireFunctionNameLength 是 Playground GenerateContent 与 CountTokens 接受的最长函数名
+const maxWireFunctionNameLength = 63
+
+// wireFunctionName 返回发往 Playground 的函数名，超长时截短并以原名的哈希结尾
+func wireFunctionName(name string) string {
+	if len(name) <= maxWireFunctionNameLength {
+		return name
+	}
+	digest := sha256.Sum256([]byte(name))
+	suffix := "_" + hex.EncodeToString(digest[:6])
+	return name[:maxWireFunctionNameLength-len(suffix)] + suffix
+}
+
+// restoreFunctionNames 在 emit 前把函数调用中的 Playground 函数名换回声明的原名
+func restoreFunctionNames(functions []FunctionDeclaration, emit func(Event) error) func(Event) error {
+	originals := map[string]string{}
+	for _, declaration := range functions {
+		if wire := wireFunctionName(declaration.Name); wire != declaration.Name {
+			originals[wire] = declaration.Name
+		}
+	}
+	if len(originals) == 0 {
+		return emit
+	}
+	return func(event Event) error {
+		if event.FunctionCall != nil {
+			if name, ok := originals[event.FunctionCall.Name]; ok {
+				call := *event.FunctionCall
+				call.Name = name
+				event.FunctionCall = &call
+			}
+		}
+		return emit(event)
+	}
 }
 
 func encodeFunctionDeclaration(declaration FunctionDeclaration) ([]any, error) {
@@ -389,13 +431,114 @@ func decodeFunctionCall(raw json.RawMessage, path string, evidence json.RawMessa
 	return call, nil
 }
 
-// encodeWireStructJSON 与 Build 相同把 JSON 值编码为 Struct，非对象值放在 result 字段
+// encodeWireStructJSON 把 JSON 值编码为 Struct，对象成员按官网页面 JSON.parse 后的键顺序排列，非对象值放在 result 字段
 func encodeWireStructJSON(raw json.RawMessage) ([]any, error) {
-	object, err := buildJSONObject(raw)
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return []any{}, nil
+	}
+	if !json.Valid(trimmed) {
+		var value any
+		return nil, fmt.Errorf("必须是 JSON: %w", json.Unmarshal(trimmed, &value))
+	}
+	value, err := decodeOrderedJSON(json.NewDecoder(bytes.NewReader(trimmed)))
 	if err != nil {
 		return nil, fmt.Errorf("必须是 JSON: %w", err)
 	}
-	return encodeWireStruct(object.(map[string]any)), nil
+	object, ok := value.(orderedObject)
+	if !ok {
+		object = orderedObject{{key: "result", value: value}}
+	}
+	return encodeOrderedStruct(object), nil
+}
+
+// orderedMember 是 JSON 对象的一个成员
+type orderedMember struct {
+	key   string
+	value any
+}
+
+// orderedObject 是按 JavaScript 对象键顺序排列成员的 JSON 对象：数组下标形式的键按数值升序在前，其余键按首次出现的顺序，重复的键取最后一个值
+type orderedObject []orderedMember
+
+// decodeOrderedJSON 从 decoder 读出一个 JSON 值，对象读成 orderedObject，数字为 float64
+func decodeOrderedJSON(decoder *json.Decoder) (any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	switch token {
+	case json.Delim('['):
+		values := []any{}
+		for decoder.More() {
+			value, err := decodeOrderedJSON(decoder)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, value)
+		}
+		_, err := decoder.Token()
+		return values, err
+	case json.Delim('{'):
+		object := orderedObject{}
+		positions := map[string]int{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return nil, err
+			}
+			key := keyToken.(string)
+			value, err := decodeOrderedJSON(decoder)
+			if err != nil {
+				return nil, err
+			}
+			if position, ok := positions[key]; ok {
+				object[position].value = value
+				continue
+			}
+			positions[key] = len(object)
+			object = append(object, orderedMember{key: key, value: value})
+		}
+		if _, err := decoder.Token(); err != nil {
+			return nil, err
+		}
+		slices.SortStableFunc(object, func(left, right orderedMember) int {
+			leftIndex, leftOK := arrayIndexKey(left.key)
+			rightIndex, rightOK := arrayIndexKey(right.key)
+			switch {
+			case leftOK && rightOK:
+				return cmp.Compare(leftIndex, rightIndex)
+			case leftOK:
+				return -1
+			case rightOK:
+				return 1
+			}
+			return 0
+		})
+		return object, nil
+	}
+	return token, nil
+}
+
+// arrayIndexKey 返回 JavaScript 视为数组下标的对象键的数值
+func arrayIndexKey(key string) (uint64, bool) {
+	if key == "" || len(key) > 1 && key[0] == '0' {
+		return 0, false
+	}
+	index, err := strconv.ParseUint(key, 10, 32)
+	return index, err == nil && index < math.MaxUint32
+}
+
+// encodeOrderedStruct 按成员顺序把 orderedObject 编码为 Struct
+func encodeOrderedStruct(object orderedObject) []any {
+	if len(object) == 0 {
+		return []any{}
+	}
+	entries := make([]any, 0, len(object))
+	for _, member := range object {
+		entries = append(entries, []any{member.key, encodeWireValue(member.value)})
+	}
+	return []any{entries}
 }
 
 func encodeWireStruct(object map[string]any) []any {
@@ -426,6 +569,8 @@ func encodeWireValue(value any) []any {
 		return []any{nil, nil, nil, typed}
 	case map[string]any:
 		return []any{nil, nil, nil, nil, encodeWireStruct(typed)}
+	case orderedObject:
+		return []any{nil, nil, nil, nil, encodeOrderedStruct(typed)}
 	case []any:
 		values := make([]any, 0, len(typed))
 		for _, item := range typed {
@@ -435,6 +580,24 @@ func encodeWireValue(value any) []any {
 	default:
 		panic(fmt.Sprintf("json.Unmarshal 返回未识别类型 %T", value))
 	}
+}
+
+// wireFunctionResult 返回 GenerateContent 正文最后一个 user 轮次只有一个函数响应 Part 时的函数结果 JSON 文本，即官网用户在函数调用块中输入的函数结果
+func wireFunctionResult(body []byte) (string, bool) {
+	var fields []json.RawMessage
+	var contents [][]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || len(fields) < 2 || json.Unmarshal(fields[1], &contents) != nil || len(contents) == 0 {
+		return "", false
+	}
+	last := contents[len(contents)-1]
+	var role string
+	var parts [][]json.RawMessage
+	var response []json.RawMessage
+	if json.Unmarshal(rawAt(last, 1), &role) != nil || role != "user" || json.Unmarshal(rawAt(last, 0), &parts) != nil || len(parts) != 1 || json.Unmarshal(rawAt(parts[0], 11), &response) != nil || len(response) < 2 {
+		return "", false
+	}
+	result, err := decodeWireStruct(response[1], "functionResponse.response", body)
+	return string(result), err == nil
 }
 
 func decodeWireStruct(raw json.RawMessage, path string, evidence json.RawMessage) (json.RawMessage, error) {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,8 +25,17 @@ type errorCodeProvider interface {
 	ErrorCode() string
 }
 
+// decodeJSON 把请求正文解码为一个 JSON 值；读取或解码失败时以同一正文与读取错误逐段解码，返回其错误
 func decodeJSON(r *http.Request, target any) error {
-	decoder := json.NewDecoder(r.Body)
+	body, readErr := io.ReadAll(r.Body)
+	if readErr == nil && json.Unmarshal(body, target) == nil {
+		return nil
+	}
+	reader := io.Reader(bytes.NewReader(body))
+	if readErr != nil {
+		reader = io.MultiReader(reader, errorReader{readErr})
+	}
+	decoder := json.NewDecoder(reader)
 	if err := decoder.Decode(target); err != nil {
 		return err
 	}
@@ -35,6 +45,11 @@ func decodeJSON(r *http.Request, target any) error {
 	}
 	return nil
 }
+
+// errorReader 每次读取都返回同一个错误
+type errorReader struct{ err error }
+
+func (reader errorReader) Read([]byte) (int, error) { return 0, reader.err }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -47,6 +62,7 @@ func streamHeaders(w http.ResponseWriter) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	return http.NewResponseController(w).Flush()
 }
@@ -57,36 +73,35 @@ func writeSSE(w http.ResponseWriter, event string, payload any) error {
 	if err != nil {
 		return err
 	}
-	frame := make([]byte, 0, len(event)+len(data)+16)
+	return writeSSEFrame(w, append(append(sseFrameStart(event, len(data)), data...), "\n\n"...))
+}
+
+// sseFrameStart 返回具名事件 SSE 帧到 data: 为止的开头，容量另留 size 字节正文
+func sseFrameStart(event string, size int) []byte {
+	frame := make([]byte, 0, len(event)+size+16)
 	if event != "" {
 		frame = append(append(append(frame, "event: "...), event...), '\n')
 	}
-	frame = append(append(append(frame, "data: "...), data...), "\n\n"...)
+	return append(frame, "data: "...)
+}
+
+// writeSSEFrame 写入完整的 SSE 帧并传播缓冲刷新错误
+func writeSSEFrame(w http.ResponseWriter, frame []byte) error {
 	if _, err := w.Write(frame); err != nil {
 		return err
 	}
 	return http.NewResponseController(w).Flush()
 }
 
+// appendJSONString 追加按 json.Marshal 转义的 JSON 字符串
+func appendJSONString(buffer []byte, value string) []byte {
+	encoded, _ := json.Marshal(value)
+	return append(buffer, encoded...)
+}
+
 // writeSSEText 写入文本事件并刷新网络缓冲
 func writeSSEText(w http.ResponseWriter, data string) error {
 	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-		return err
-	}
-	return http.NewResponseController(w).Flush()
-}
-
-// writeGeminiHeartbeat 发送不触发事件的空行并传播连接错误
-func writeGeminiHeartbeat(w http.ResponseWriter) error {
-	if _, err := io.WriteString(w, "\n"); err != nil {
-		return err
-	}
-	return http.NewResponseController(w).Flush()
-}
-
-// writeSSEHeartbeat 发送心跳并传播连接错误
-func writeSSEHeartbeat(w http.ResponseWriter) error {
-	if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
 		return err
 	}
 	return http.NewResponseController(w).Flush()
@@ -151,12 +166,29 @@ func codeFromError(err error, defaultCode string) string {
 // requestProtocol 返回请求路径与请求头所属的公开协议：gemini、anthropic 或 openai
 func requestProtocol(r *http.Request) string {
 	switch {
-	case strings.HasPrefix(r.URL.Path, "/v1beta/"), strings.HasPrefix(r.URL.Path, "/upload/"), interactionsPath(r.URL.Path):
+	case strings.HasPrefix(r.URL.Path, "/v1beta/"), strings.HasPrefix(r.URL.Path, "/upload/"), interactionsPath(r.URL.Path), geminiV1Path(r):
 		return "gemini"
 	case strings.HasPrefix(r.URL.Path, "/v1/messages"), r.Header.Get("Anthropic-Version") != "":
 		return "anthropic"
 	}
 	return "openai"
+}
+
+// geminiV1Path 表示 /v1 下的 Gemini API 请求：模型方法调用、上下文缓存与长时操作，以及以 Gemini API 方式鉴权的模型与文件请求
+func geminiV1Path(r *http.Request) bool {
+	path := r.URL.Path
+	switch {
+	case r.Method == http.MethodPost && strings.HasPrefix(path, "/v1/models/"), strings.HasPrefix(path, "/v1/cachedContents"), strings.HasPrefix(path, "/v1/operations/"):
+		return true
+	case path == "/v1/models", strings.HasPrefix(path, "/v1/models/"), path == "/v1/files", strings.HasPrefix(path, "/v1/files/"):
+		return geminiAuth(r)
+	}
+	return false
+}
+
+// geminiAuth 表示请求以 Gemini API 的方式鉴权：带 x-goog-api-key 请求头或 key 查询参数，不带 Authorization
+func geminiAuth(r *http.Request) bool {
+	return r.Header.Get("Authorization") == "" && (r.Header.Get("X-Goog-Api-Key") != "" || r.URL.Query().Has("key"))
 }
 
 // writeAuthError 按请求所属协议写入 API key 错误，OpenAI 与 Anthropic 为 401
@@ -314,16 +346,36 @@ func writeGeminiError(w http.ResponseWriter, status int, statusName string, mess
 	}}))
 }
 
-// writeOpenAIRequestError 以 OpenAI 错误体写出请求失败，可重试时带 Retry-After
+// writeOpenAIRequestError 以 OpenAI 错误体写出请求失败，可重试时带 Retry-After 并在消息末尾写明重试时间
 func writeOpenAIRequestError(w http.ResponseWriter, err error) {
-	setRetryAfter(w, err)
-	writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+	seconds := setRetryAfter(w, err)
+	writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), retryMessage(err.Error(), seconds))
 }
 
-// writeAnthropicRequestError 以 Anthropic 错误体写出请求失败，可重试时带 Retry-After
+// writeOpenAISSEError 在已开始的 OpenAI 事件流中以 error 数据帧写出请求失败，可重试时在消息末尾写明重试时间
+func writeOpenAISSEError(w http.ResponseWriter, err error) {
+	status := statusFromError(err)
+	code := openAIErrorCode(err)
+	_ = writeSSE(w, "", map[string]any{"error": openAIErrorBody{
+		Message: retryMessage(publicErrorMessage(status, err.Error()), retryAfterSeconds(err)), Type: openAIErrorType(status, code), Code: code,
+	}})
+}
+
+// writeAnthropicRequestError 以 Anthropic 错误体写出请求失败，可重试时带 Retry-After 并在消息末尾写明重试时间
 func writeAnthropicRequestError(w http.ResponseWriter, err error) {
-	setRetryAfter(w, err)
-	writeAnthropicError(w, statusFromError(err), anthropicErrorType(err), anthropicErrorMessage(err))
+	seconds := setRetryAfter(w, err)
+	writeAnthropicError(w, statusFromError(err), anthropicErrorType(err), retryMessage(anthropicErrorMessage(err), seconds))
+}
+
+// retryMessage 在 seconds 大于 0 时于消息末尾按 OpenAI 限流消息的写法另起一句 Please try again in <seconds>s.
+func retryMessage(message string, seconds int64) string {
+	if seconds <= 0 {
+		return message
+	}
+	if !strings.HasSuffix(message, ".") {
+		message += "."
+	}
+	return message + " Please try again in " + strconv.FormatInt(seconds, 10) + "s."
 }
 
 // contextOverflow 判断错误是否为上游的上下文超限
@@ -342,17 +394,31 @@ func anthropicErrorMessage(err error) string {
 
 // writeGeminiRequestError 以 Gemini 错误体写出请求失败，可重试时带 Retry-After 与 RetryInfo
 func writeGeminiRequestError(w http.ResponseWriter, err error) {
-	status := statusFromError(err)
-	payload := map[string]any{"code": status, "message": err.Error(), "status": geminiErrorStatus(err)}
-	if seconds := setRetryAfter(w, err); seconds > 0 {
+	payload := geminiErrorPayload(err, setRetryAfter(w, err))
+	setAccessLogResponseError(w, err.Error())
+	writeJSON(w, statusFromError(err), officialOrder("gemini", map[string]any{"error": payload}))
+}
+
+// geminiErrorPayload 返回 Gemini 错误对象，seconds 大于 0 时 details 带该时长的 RetryInfo
+func geminiErrorPayload(err error, seconds int64) map[string]any {
+	payload := map[string]any{"code": statusFromError(err), "message": err.Error(), "status": geminiErrorStatus(err)}
+	if seconds > 0 {
 		payload["details"] = []any{map[string]any{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": strconv.FormatInt(seconds, 10) + "s"}}
 	}
-	setAccessLogResponseError(w, err.Error())
-	writeJSON(w, status, officialOrder("gemini", map[string]any{"error": payload}))
+	return payload
 }
 
 // setRetryAfter 在错误给出可重试时刻时写入 Retry-After 秒数并返回它，否则返回 0
 func setRetryAfter(w http.ResponseWriter, err error) int64 {
+	seconds := retryAfterSeconds(err)
+	if seconds > 0 {
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	}
+	return seconds
+}
+
+// retryAfterSeconds 返回错误给出的可重试时刻距现在的秒数，没有可重试时刻时返回 0
+func retryAfterSeconds(err error) int64 {
 	var retry interface{ RetryAt(time.Time) time.Time }
 	if !errors.As(err, &retry) {
 		return 0
@@ -362,9 +428,7 @@ func setRetryAfter(w http.ResponseWriter, err error) int64 {
 	if !at.After(now) {
 		return 0
 	}
-	seconds := int64(math.Ceil(at.Sub(now).Seconds()))
-	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-	return seconds
+	return int64(math.Ceil(at.Sub(now).Seconds()))
 }
 
 func writeAdminError(w http.ResponseWriter, status int, code string, message string) {

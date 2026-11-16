@@ -1,0 +1,19 @@
+name: Static Libraries
+description: 下载 Mag1cFall/libwebp Release 中指定目标的 libwebp 静态库与头文件，并设置 cgo 的头文件与链接路径
+inputs:
+  target:
+    description: 静态库目标，如 linux-amd64、linux-amd64-gnu、windows-amd64、darwin-arm64
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        LIBWEBP: v1.6.0-aistudio2api.1
+      run: |
+        libwebp="$RUNNER_TEMP/libwebp/$TARGET"
+        mkdir -p "$libwebp"
+        curl -fsSL "https://github.com/Mag1cFall/libwebp/releases/download/$LIBWEBP/libwebp-$LIBWEBP-$TARGET.tar.gz" | tar -xz -C "$libwebp"
+        echo "CGO_CPPFLAGS=-I$libwebp/include" >> "$GITHUB_ENV"
+        echo "CGO_LDFLAGS=-L$libwebp/lib" >> "$GITHUB_ENV"

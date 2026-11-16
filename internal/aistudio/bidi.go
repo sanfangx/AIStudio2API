@@ -206,8 +206,9 @@ type BidiEvent struct {
 	Err           error              `json:"-"`
 }
 
-// EncodeBidiSetupRequest 编码 Live 或 Robotics 的已验证 setup 帧
+// EncodeBidiSetupRequest 编码 Live 或 Robotics 的已验证 setup 帧，系统指令按 clientSystemText 改写
 func EncodeBidiSetupRequest(request BidiRequest, runtime RequestContext) ([]byte, string, error) {
+	request.SystemInstruction = clientSystemText(request.SystemInstruction)
 	model := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
 	if model == "" {
 		return nil, "", fmt.Errorf("%w: bidi model 不能为空", ErrInvalidArgument)
@@ -754,7 +755,7 @@ func parseBidiContent(raw json.RawMessage, evidence json.RawMessage) ([]BidiEven
 	decoder := NewFrameDecoder()
 	events := make([]BidiEvent, 0, len(parts))
 	for index, partRaw := range parts {
-		decoded, err := decoder.decodePart(partRaw, fmt.Sprintf("$message[2][0][0][%d]", index), evidence)
+		decoded, err := decoder.decodePart(nil, partRaw, fmt.Sprintf("$message[2][0][0][%d]", index), evidence)
 		if err != nil {
 			return nil, withBidiMethod(err)
 		}

@@ -46,8 +46,7 @@ func TestAuthRefreshWithoutExtension(t *testing.T) {
 			})
 			return updated, nil
 		},
-		reset:          func(string) error { return nil },
-		prepareHeaders: func(string) (func(bool), error) { return func(bool) {}, nil },
+		reset: func(string) error { return nil },
 	}
 	ctx := aistudio.ContextWithAccountLease(t.Context(), lease)
 	if !refresher.Available(ctx) {
@@ -66,6 +65,7 @@ func TestAuthRefreshWithoutExtension(t *testing.T) {
 	}
 
 	login := aistudio.StorageState{Cookies: cookies}
+	login.SetAuthExtension(aistudio.AuthExtension{Source: aistudio.AuthSource{Browser: "camoufox", Email: account.ID}})
 	if err := keepAuthExtension(&login, stored); err != nil {
 		t.Fatal(err)
 	}
