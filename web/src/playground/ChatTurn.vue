@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref } from 'vue'
 import {
   DropdownMenuContent,
   DropdownMenuItem,
@@ -12,8 +11,11 @@ import { useRouter } from 'vue-router'
 import { useConsole } from '@/console'
 import { useI18n } from '@/i18n'
 import UiIcon from '@/playground/ui/UiIcon.vue'
+import { copyToClipboard } from './clipboard'
+import { useRunningClock } from './clock'
 import CodeBlock from './CodeBlock.vue'
 import FileChunk from './FileChunk.vue'
+import FunctionCallChunk from './FunctionCallChunk.vue'
 import { driveNames } from './drive'
 import LoadingIndicator from './LoadingIndicator.vue'
 import MarkdownView from './MarkdownView.vue'
@@ -21,6 +23,7 @@ import RunStats from './RunStats.vue'
 import ThoughtChunk from './ThoughtChunk.vue'
 import VideoResult from './media/VideoResult.vue'
 import { insertCitations } from './markdown'
+import { dataURL } from './protocols'
 import { useReveal } from './reveal'
 import { youtubeVideoID } from './sample-media'
 import { usePlayground } from './session'
@@ -44,7 +47,6 @@ const answer = ref<HTMLElement>()
 const editing = ref(false)
 const draft = ref('')
 const editor = ref<HTMLTextAreaElement>()
-const functionReply = ref('')
 // visible 表示轮次在视口附近；离屏且不在生成时用占位高度代替内容
 const visible = ref(true)
 const height = ref(0)
@@ -106,6 +108,16 @@ const fullTime = computed(() =>
 const roleLabel = computed(() => (props.turn.role === 'user' ? t('pg.user') : t('pg.model')))
 // hasThoughtSegment 表示模型轮次单独显示思考段
 const hasThoughtSegment = computed(() => props.turn.role === 'model' && thoughtText.value !== '')
+// hasStickyCode 表示回复段含有块级代码标题，供操作栏避让粘性标题而无需全树匹配 :has(.ms-code-block)
+const hasStickyCode = computed(() =>
+  answerParts.value.some(
+    (part) =>
+      part.functionCall !== undefined ||
+      part.executableCode !== undefined ||
+      part.codeExecutionResult !== undefined ||
+      (part.text !== undefined && (part.text.includes('```') || part.text.includes('~~~'))),
+  ),
+)
 // hasAnswerSegment 表示需要显示回复段
 const hasAnswerSegment = computed(
   () =>
@@ -116,20 +128,11 @@ const hasAnswerSegment = computed(
     waiting.value ||
     (props.turn.sources?.length ?? 0) > 0,
 )
-// now 是生成中每 100 ms 更新的时刻，轮次耗时与官网一样随之计数
-const now = ref(performance.now())
-let ticker = 0
-watch(
-  () => props.streaming,
-  (running) => {
-    window.clearInterval(ticker)
-    if (running) ticker = window.setInterval(() => (now.value = performance.now()), 100)
-  },
-  { immediate: true },
-)
+// now 是生成中每 100 ms 更新的时刻
+const now = useRunningClock(() => props.streaming)
 // elapsed 是生成中从提交起的耗时
 const elapsed = computed(() =>
-  props.streaming ? Math.max(0, Math.round(now.value - session.started)) : undefined,
+  props.streaming ? Math.round(now.value - session.started) : undefined,
 )
 // thoughtDuration 是思考段的耗时，思考结束前随生成计数
 const thoughtDuration = computed(() => props.turn.thinking ?? elapsed.value)
@@ -150,20 +153,6 @@ const awaitingResponse = computed(
     answerParts.value.some((part) => part.functionCall) &&
     !props.responses?.length,
 )
-
-// mediaURL 返回内联媒体的 data URL
-function mediaURL(part: Part): string {
-  return `data:${part.inlineData?.mimeType};base64,${part.inlineData?.data}`
-}
-
-// mediaKind 返回内联媒体的类型
-function mediaKind(part: Part): 'image' | 'audio' | 'video' | 'file' {
-  const mime = part.inlineData?.mimeType ?? part.fileData?.mimeType ?? ''
-  if (mime.startsWith('image/')) return 'image'
-  if (mime.startsWith('audio/')) return 'audio'
-  if (mime.startsWith('video/')) return 'video'
-  return 'file'
-}
 
 // executionCode 与官网一致：执行结果出错时显示超时或失败说明加错误输出
 function executionCode(result: NonNullable<Part['codeExecutionResult']>): string {
@@ -187,29 +176,16 @@ function responseText(call: NonNullable<Part['functionCall']>): string {
     : JSON.stringify(response)
 }
 
-// sendResponse 以函数响应继续生成
-function sendResponse(call: NonNullable<Part['functionCall']>): void {
-  if (functionReply.value.trim() === '') return
-  playground.respond(call, functionReply.value)
-  functionReply.value = ''
-}
-
 // startEdit 进入编辑：文本变为可编辑文本框
 async function startEdit(): Promise<void> {
   if (editing.value) {
     finishEdit()
     return
   }
-  draft.value =
-    props.turn.role === 'user'
-      ? (props.turn.parts.find((part) => part.text)?.text ?? '')
-      : answerParts.value
-          .filter((part) => part.text !== undefined)
-          .map((part) => part.text)
-          .join('')
+  draft.value = plainText()
   editing.value = true
   await nextTick()
-  editor.value?.focus()
+  editor.value!.focus()
   resizeEditor()
 }
 
@@ -222,8 +198,7 @@ function finishEdit(): void {
 
 // resizeEditor 让编辑框随内容增高
 function resizeEditor(): void {
-  const element = editor.value
-  if (element === undefined) return
+  const element = editor.value!
   element.style.height = 'auto'
   element.style.height = `${element.scrollHeight}px`
 }
@@ -238,18 +213,6 @@ function plainText(): string {
         .join('')
 }
 
-// copyText 复制回复的纯文本
-async function copyText(): Promise<void> {
-  await navigator.clipboard.writeText(answer.value?.innerText ?? plainText())
-  showNotice(t('pg.copied'), 'success')
-}
-
-// copyMarkdown 复制回复的 Markdown 原文
-async function copyMarkdown(): Promise<void> {
-  await navigator.clipboard.writeText(plainText())
-  showNotice(t('pg.copied'), 'success')
-}
-
 // branch 从这一轮创建分支并打开
 async function branch(): Promise<void> {
   try {
@@ -260,30 +223,33 @@ async function branch(): Promise<void> {
   }
 }
 
-let intersection: IntersectionObserver | undefined
-let resize: ResizeObserver | undefined
+let intersection: IntersectionObserver
+const resize = new ResizeObserver(([entry]) => {
+  if (visible.value) height.value = entry!.contentRect.height
+})
+
+// observe 观察轮次是否在视口附近与它的高度
+function observe(): void {
+  intersection.observe(root.value!)
+  resize.observe(root.value!)
+}
+
+// disconnect 停止观察轮次
+function disconnect(): void {
+  intersection.disconnect()
+  resize.disconnect()
+}
 
 onMounted(() => {
   intersection = new IntersectionObserver(
-    ([entry]) => {
-      visible.value = entry?.isIntersecting ?? true
-    },
-    { root: root.value?.closest('.chat-scroller') ?? null, rootMargin: '1500px 0px' },
+    (entries) => (visible.value = entries.at(-1)!.isIntersecting),
+    { root: root.value!.closest('.chat-scroller'), rootMargin: '1500px 0px' },
   )
-  resize = new ResizeObserver(([entry]) => {
-    if (visible.value && entry) height.value = entry.contentRect.height
-  })
-  if (root.value) {
-    intersection.observe(root.value)
-    resize.observe(root.value)
-  }
+  observe()
 })
-
-onUnmounted(() => {
-  intersection?.disconnect()
-  resize?.disconnect()
-  window.clearInterval(ticker)
-})
+onUnmounted(disconnect)
+onDeactivated(disconnect)
+onActivated(observe)
 </script>
 
 <template>
@@ -295,12 +261,7 @@ onUnmounted(() => {
   >
     <div v-if="!visible && !streaming && height > 0" :style="{ height: `${height}px` }"></div>
     <template v-else>
-      <div
-        v-if="hasThoughtSegment"
-        tabindex="-1"
-        class="chat-turn-container model"
-        :class="{ 'menu-open': false }"
-      >
+      <div v-if="hasThoughtSegment" tabindex="-1" class="chat-turn-container model">
         <div class="actions-container">
           <div class="actions hover-or-edit">
             <button
@@ -368,7 +329,7 @@ onUnmounted(() => {
         v-if="hasAnswerSegment"
         tabindex="-1"
         class="chat-turn-container"
-        :class="[turn.role, { edit: editing }]"
+        :class="[turn.role, { edit: editing, 'has-code': hasStickyCode }]"
       >
         <div class="actions-container">
           <div class="actions hover-or-edit">
@@ -422,11 +383,14 @@ onUnmounted(() => {
                     <UiIcon name="branch" :size="18" />
                     <span class="ms-menu-item-text">{{ t('pg.branch') }}</span>
                   </DropdownMenuItem>
-                  <DropdownMenuItem class="ms-menu-item" @select="copyText">
+                  <DropdownMenuItem
+                    class="ms-menu-item"
+                    @select="copyToClipboard(answer?.innerText ?? plainText())"
+                  >
                     <UiIcon name="copy" :size="18" />
                     <span class="ms-menu-item-text">{{ t('pg.copyText') }}</span>
                   </DropdownMenuItem>
-                  <DropdownMenuItem class="ms-menu-item" @select="copyMarkdown">
+                  <DropdownMenuItem class="ms-menu-item" @select="copyToClipboard(plainText())">
                     <UiIcon name="markdownCopy" :size="18" />
                     <span class="ms-menu-item-text">{{ t('pg.copyMarkdown') }}</span>
                   </DropdownMenuItem>
@@ -452,19 +416,19 @@ onUnmounted(() => {
           >
             <template v-if="part.inlineData || part.fileData">
               <img
-                v-if="mediaKind(part) === 'image' && part.inlineData"
+                v-if="part.inlineData?.mimeType.startsWith('image/')"
                 class="media-image"
-                :src="mediaURL(part)"
+                :src="dataURL(part.inlineData)"
                 alt=""
               />
               <audio
-                v-else-if="mediaKind(part) === 'audio' && part.inlineData"
+                v-else-if="part.inlineData?.mimeType.startsWith('audio/')"
                 controls
-                :src="mediaURL(part)"
+                :src="dataURL(part.inlineData)"
               ></audio>
               <VideoResult
-                v-else-if="mediaKind(part) === 'video' && part.inlineData"
-                :src="mediaURL(part)"
+                v-else-if="part.inlineData?.mimeType.startsWith('video/')"
+                :src="dataURL(part.inlineData)"
               />
               <a
                 v-else-if="part.fileData && !youtubeVideoID(part.fileData.fileUri)"
@@ -484,44 +448,13 @@ onUnmounted(() => {
                 :class="{ 'chunk-gap': partIndex < answerParts.length - 1 }"
               />
             </template>
-            <CodeBlock
+            <FunctionCallChunk
               v-else-if="part.functionCall"
-              :code="
-                part.functionCall.args ? JSON.stringify(part.functionCall.args, undefined, 2) : ''
-              "
-              :header-text="part.functionCall.name"
-              icon="functionCalling"
-              show-divider
-            >
-              <form class="function-response" @submit.prevent="sendResponse(part.functionCall)">
-                <input
-                  v-if="awaitingResponse"
-                  v-model="functionReply"
-                  ms-input
-                  class="function-response-input"
-                  :aria-label="t('pg.functionResponse')"
-                  :placeholder="t('pg.functionResponse')"
-                />
-                <input
-                  v-else
-                  ms-input
-                  class="function-response-input"
-                  :aria-label="t('pg.functionResponse')"
-                  :placeholder="t('pg.functionResponse')"
-                  :value="responseText(part.functionCall)"
-                  disabled
-                />
-                <button
-                  v-if="awaitingResponse"
-                  type="submit"
-                  ms-button
-                  class="ms-button-primary"
-                  :disabled="functionReply.trim() === ''"
-                >
-                  {{ t('pg.send') }}
-                </button>
-              </form>
-            </CodeBlock>
+              :call="part.functionCall"
+              :response="responseText(part.functionCall)"
+              :awaiting="awaitingResponse"
+              @respond="playground.respond(part.functionCall, $event)"
+            />
             <CodeBlock
               v-else-if="part.executableCode"
               :code="part.executableCode.code"
@@ -651,7 +584,7 @@ onUnmounted(() => {
 }
 
 .chat-turn-container:focus-visible,
-.chat-turn-container:has([aria-expanded='true'][aria-haspopup='menu']):not(.edit) {
+.chat-turn-container:not(.edit):has(> .actions-container [aria-expanded='true']) {
   border-color: var(--color-v3-outline);
 }
 
@@ -660,12 +593,13 @@ onUnmounted(() => {
     border-color: var(--color-v3-outline);
   }
 
-  .chat-turn-container:hover .hover-or-edit {
+  .chat-turn-container:hover > .actions-container .hover-or-edit,
+  .chat-turn-container:hover > .turn-footer .hover-or-edit {
     opacity: 1;
     pointer-events: auto;
   }
 
-  .chat-turn-container:hover .turn-footer {
+  .chat-turn-container:hover > .turn-footer {
     background-color: var(--color-v3-surface);
   }
 }
@@ -684,7 +618,7 @@ onUnmounted(() => {
   height: 0;
 }
 
-.chat-turn-container:has(.ms-code-block .code-header.sticky) .actions-container {
+.chat-turn-container.has-code > .actions-container {
   top: calc(56px * var(--ms-autoscroll-container-scrolled, 1));
   transition: top 0.6s ease-in-out;
 }
@@ -701,11 +635,11 @@ onUnmounted(() => {
   background-color: var(--color-v3-surface-container-high);
 }
 
-.chat-turn-container.model:has(.ms-code-block .code-header.sticky) .actions {
+.chat-turn-container.model.has-code > .actions-container .actions {
   right: 8px;
 }
 
-.chat-turn-container.user:has(.ms-code-block .code-header.sticky) .actions {
+.chat-turn-container.user.has-code > .actions-container .actions {
   right: 20px;
 }
 
@@ -715,9 +649,14 @@ onUnmounted(() => {
   transition: opacity 0.3s ease-in-out;
 }
 
-.chat-turn-container:focus-within .hover-or-edit,
-.chat-turn-container:has([aria-expanded='true'][aria-haspopup='menu']) .hover-or-edit,
-.chat-turn-container.edit .hover-or-edit {
+.chat-turn-container:focus-within > .actions-container .hover-or-edit,
+.chat-turn-container:focus-within > .turn-footer .hover-or-edit,
+.chat-turn-container:has(> .actions-container [aria-expanded='true'])
+  > .actions-container
+  .hover-or-edit,
+.chat-turn-container:has(> .actions-container [aria-expanded='true']) > .turn-footer .hover-or-edit,
+.chat-turn-container.edit > .actions-container .hover-or-edit,
+.chat-turn-container.edit > .turn-footer .hover-or-edit {
   opacity: 1;
   pointer-events: auto;
 }
@@ -879,17 +818,6 @@ onUnmounted(() => {
 
 .chip:hover {
   background-color: var(--color-search-entry-point-chip-hover-background-color);
-}
-
-.function-response {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px;
-}
-
-.function-response-input {
-  flex: 1;
 }
 
 .media-image {

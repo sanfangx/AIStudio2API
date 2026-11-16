@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"context"
 	"maps"
 	"slices"
 	"sort"
@@ -51,15 +52,51 @@ func (p *AccountPool) SetModelChannels(channels map[string]Channel) {
 	p.notifyLocked()
 }
 
+// apiKeyContextKey 是请求上下文中所用 API key 的键
+type apiKeyContextKey struct{}
+
+// ContextWithAPIKey 返回带有请求所用 API key 的上下文，账户池只在该 key 绑定的账户中选号
+func ContextWithAPIKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, apiKeyContextKey{}, key)
+}
+
+// SetAPIKeyAccounts 设置各 API key 可用的账户 ID，未列出的 key 可用全部账户
+func (p *AccountPool) SetAPIKeyAccounts(accounts map[string][]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.apiKeyAccounts = maps.Clone(accounts)
+	p.notifyLocked()
+}
+
+// keyScopedSelection 把请求所用 API key 绑定的账户并入选择的允许账户
+func (p *AccountPool) keyScopedSelection(ctx context.Context, selection AccountSelection) AccountSelection {
+	key, _ := ctx.Value(apiKeyContextKey{}).(string)
+	if key == "" {
+		return selection
+	}
+	p.mu.Lock()
+	scope, bound := p.apiKeyAccounts[key]
+	p.mu.Unlock()
+	if !bound {
+		return selection
+	}
+	if selection.AllowedAccountIDs == nil {
+		selection.AllowedAccountIDs = scope
+		return selection
+	}
+	selection.AllowedAccountIDs = slices.DeleteFunc(slices.Clone(selection.AllowedAccountIDs), func(id string) bool { return !slices.Contains(scope, id) })
+	return selection
+}
+
 // SetBuildCatalog 保存账户 Build 代理返回的 Gemini API 模型目录
 func (p *AccountPool) SetBuildCatalog(accountID string, models []Model) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	account := p.byID[strings.TrimSpace(accountID)]
+	account := p.byID[accountID]
 	if account == nil {
 		return ErrAccountNotFound
 	}
-	account.buildModels = cloneAccountModels(models)
+	account.buildModels = cloneModels(models)
 	p.notifyLocked()
 	return nil
 }
@@ -171,7 +208,7 @@ func (p *AccountPool) preferredChannelOpenLocked(account *Account, selection Acc
 		!p.channelSupportsLocked(account, preferred, selection) {
 		return false
 	}
-	_, cooling := accountCooldown(account, ChannelCooldownScope(preferred, selectionAccessScope(selection)), now)
+	_, cooling := selectionCooldown(account, ChannelCooldownScope(preferred, selectionAccessScope(selection)), selection, now)
 	return !cooling
 }
 
@@ -218,7 +255,7 @@ func (p *AccountPool) accountChannelCooldownLocked(account *Account, selection A
 		if !p.channelSupportsLocked(account, channel, selection) {
 			continue
 		}
-		cooldown, active := accountCooldown(account, ChannelCooldownScope(channel, scope), now)
+		cooldown, active := selectionCooldown(account, ChannelCooldownScope(channel, scope), selection, now)
 		if !active {
 			return CooldownState{}, false
 		}
@@ -287,9 +324,6 @@ func (p *AccountPool) modelCapabilityLocked(modelID string, capability string) b
 		return false
 	}
 	for _, account := range p.accounts {
-		if account == nil {
-			continue
-		}
 		for _, model := range account.Models {
 			if model.ID == modelID {
 				return model.Capabilities[capability]
@@ -313,9 +347,6 @@ func (p *AccountPool) buildSupportsModelLocked(account *Account, modelID string,
 		return false
 	}
 	for _, candidate := range p.accounts {
-		if candidate == nil {
-			continue
-		}
 		for _, model := range candidate.Models {
 			if modelMatchesID(model, modelID) {
 				return !buildExcludedPlaygroundModel(model) && (anyTier || modelAllowedByTier(model, account.BenefitTier))
@@ -379,14 +410,14 @@ func (p *AccountPool) buildOnlyModelsLocked() []Model {
 	var models []Model
 	seen := make(map[string]struct{})
 	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled {
+		if !account.Config.Enabled {
 			continue
 		}
 		for _, model := range account.buildModels {
 			if _, exists := seen[model.ID]; exists || p.hasPlaygroundModelLocked(model.ID) {
 				continue
 			}
-			listed := cloneAccountModels([]Model{model})[0]
+			listed := cloneModels([]Model{model})[0]
 			if !hasMethod(model, "generateContent") {
 				listed.Methods = buildPublicMethods(model)
 			} else if !p.buildSupportsModelLocked(account, model.ID, false) {
@@ -404,9 +435,6 @@ func (p *AccountPool) buildOnlyModelsLocked() []Model {
 
 func (p *AccountPool) hasPlaygroundModelLocked(modelID string) bool {
 	for _, account := range p.accounts {
-		if account == nil {
-			continue
-		}
 		for _, model := range account.Models {
 			if modelMatchesID(model, modelID) {
 				return true
@@ -435,16 +463,12 @@ func (p *AccountPool) OutputContinuationRounds(modelID string, maxOutputTokens *
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, account := range p.accounts {
-		if account == nil {
-			continue
-		}
 		for _, model := range account.Models {
 			if modelMatchesID(model, modelID) && model.Capabilities["output_continuation"] {
-				requested := model.OutputTokenLimit
+				total := max(model.InputTokenLimit, continuationRoundTokens)
 				if maxOutputTokens != nil {
-					requested = *maxOutputTokens
+					total = min(*maxOutputTokens, total)
 				}
-				total := min(requested, max(model.InputTokenLimit, continuationRoundTokens))
 				return max(1, int((total+continuationRoundTokens-1)/continuationRoundTokens))
 			}
 		}
@@ -457,9 +481,6 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
 		return false
 	}
 	for _, account := range p.accounts {
-		if account == nil {
-			continue
-		}
 		for _, model := range account.buildModels {
 			if model.ID != modelID || method != "" && !hasMethod(model, method) {
 				continue
@@ -488,7 +509,7 @@ func (p *AccountPool) modelChannelsLocked(model Model, anyTier bool) []string {
 	var channels []string
 	for _, channel := range p.selectionChannelsLocked(selection) {
 		for _, account := range p.accounts {
-			if account != nil && account.Config.Enabled && p.channelSupportsLocked(account, channel, selection) {
+			if account.Config.Enabled && p.channelSupportsLocked(account, channel, selection) {
 				channels = append(channels, string(channel))
 				break
 			}
@@ -499,12 +520,9 @@ func (p *AccountPool) modelChannelsLocked(model Model, anyTier bool) []string {
 
 // AccountChannelAvailable 返回账户是否还有支持选择且未冷却的通道
 func (p *AccountPool) AccountChannelAvailable(accountID string, selection AccountSelection) bool {
-	if p == nil {
-		return false
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	account := p.byID[strings.TrimSpace(accountID)]
+	account := p.byID[accountID]
 	if account == nil || !account.Config.Enabled || !p.accountSupportsAnyChannelLocked(account, selection) {
 		return false
 	}

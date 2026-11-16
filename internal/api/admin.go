@@ -38,6 +38,7 @@ type AdminService interface {
 	Requests(context.Context) ([]AdminRequest, error)
 	CancelRequest(context.Context, string) error
 	Events(context.Context) (<-chan AdminEvent, error)
+	FirstEventLatencies() []FirstEventLatency
 	RecordAccessStart(AccessLog)
 	RecordAccessLog(AccessLog)
 }
@@ -51,6 +52,13 @@ type AdminStatus struct {
 	ActiveRequests int                `json:"active_requests"`
 	Accounts       AdminAccountCounts `json:"accounts"`
 	Camoufox       AdminCamoufox      `json:"camoufox"`
+}
+
+// InvalidConfigValue 表示加载时取值无效、按默认值生效的一个配置项
+type InvalidConfigValue struct {
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+	Reason string `json:"reason"`
 }
 
 // AdminCamoufox 表示 Camoufox 是否就绪与正在进行的下载
@@ -241,47 +249,55 @@ type ChromeImportInput struct {
 
 // RuntimeConfig 表示全局运行配置
 type RuntimeConfig struct {
-	AutoStart                 bool         `json:"auto_start"`
-	RequestBodyLog            bool         `json:"request_body_log"`
-	AdminAuthEnabled          bool         `json:"admin_auth_enabled"`
-	AdminUsername             string       `json:"admin_username"`
-	AdminPassword             *string      `json:"admin_password,omitempty"`
-	AdminPasswordSet          bool         `json:"admin_password_set"`
-	SavedAdminPassword        string       `json:"-"`
-	BuildNativeNonstream      bool         `json:"build_native_nonstream"`
-	NonstreamKeepalive        bool         `json:"nonstream_keepalive"`
-	FakeStream                bool         `json:"fake_stream"`
-	YouTubeLinks              bool         `json:"youtube_links"`
-	FirstEventHedge           string       `json:"first_event_hedge"`
-	LogFile                   bool         `json:"log_file"`
-	LogMaxTotalMB             int          `json:"log_max_total_mb"`
-	AuthStates                string       `json:"auth_states"`
-	ListenAddr                string       `json:"listen_addr"`
-	APIKey                    string       `json:"proxy_api_key"`
-	ActiveListenAddr          string       `json:"active_listen_addr"`
-	ReservedListenAddr        string       `json:"reserved_listen_addr"`
-	PreviewListenAddr         string       `json:"preview_listen_addr"`
-	ActivePreviewListenAddr   string       `json:"active_preview_listen_addr"`
-	ActiveAPIKey              string       `json:"active_proxy_api_key"`
-	ManagementRestartRequired bool         `json:"management_restart_required"`
-	ServiceRestartRequired    bool         `json:"service_restart_required"`
-	Proxy                     string       `json:"proxy"`
-	ActiveProxy               string       `json:"active_proxy"`
-	ProxyPool                 []AdminProxy `json:"proxy_pool"`
-	InitTimeout               string       `json:"init_timeout"`
-	RequestTimeout            string       `json:"request_timeout"`
-	WarmWorkerLimit           int          `json:"warm_worker_limit"`
-	MaxActiveWorkers          int          `json:"max_active_workers"`
-	WarmStartupConcurrency    int          `json:"warm_startup_concurrency"`
-	PerAccountConcurrency     int          `json:"per_account_concurrency"`
-	RoutingStrategy           string       `json:"routing_strategy"`
-	UpstreamChannels          []string     `json:"upstream_channels"`
-	ModelMapping              string       `json:"model_mapping"`
-	ModelChannels             string       `json:"model_channels"`
-	TemporaryChat             bool         `json:"temporary_chat"`
-	WAABackend                string       `json:"waa_backend"`
-	MediaOutput               string       `json:"media_output"`
-	MediaBaseURL              string       `json:"media_base_url"`
+	AutoStart                 bool                 `json:"auto_start"`
+	RequestBodyLog            bool                 `json:"request_body_log"`
+	AdminAuthEnabled          bool                 `json:"admin_auth_enabled"`
+	AdminUsername             string               `json:"admin_username"`
+	AdminPassword             *string              `json:"admin_password,omitempty"`
+	AdminPasswordSet          bool                 `json:"admin_password_set"`
+	SavedAdminPassword        string               `json:"-"`
+	BuildNativeNonstream      bool                 `json:"build_native_nonstream"`
+	NonstreamKeepalive        bool                 `json:"nonstream_keepalive"`
+	FakeStream                bool                 `json:"fake_stream"`
+	YouTubeLinks              bool                 `json:"youtube_links"`
+	SearchModelAliases        bool                 `json:"search_model_aliases"`
+	GoogleSearch              bool                 `json:"google_search"`
+	FirstEventHedge           string               `json:"first_event_hedge"`
+	FirstEventHedgeModels     string               `json:"first_event_hedge_models"`
+	ContinuationRewrite       bool                 `json:"continuation_rewrite"`
+	ContinuationPrompt        string               `json:"continuation_prompt"`
+	LogFile                   bool                 `json:"log_file"`
+	LogMaxTotalMB             int                  `json:"log_max_total_mb"`
+	AuthStates                string               `json:"auth_states"`
+	ListenAddr                string               `json:"listen_addr"`
+	APIKey                    string               `json:"proxy_api_key"`
+	ActiveListenAddr          string               `json:"active_listen_addr"`
+	ReservedListenAddr        string               `json:"reserved_listen_addr"`
+	PreviewListenAddr         string               `json:"preview_listen_addr"`
+	ActivePreviewListenAddr   string               `json:"active_preview_listen_addr"`
+	ActiveAPIKey              string               `json:"active_proxy_api_key"`
+	ManagementRestartRequired bool                 `json:"management_restart_required"`
+	ServiceRestartRequired    bool                 `json:"service_restart_required"`
+	Proxy                     string               `json:"proxy"`
+	ActiveProxy               string               `json:"active_proxy"`
+	ProxyPool                 []AdminProxy         `json:"proxy_pool"`
+	InitTimeout               string               `json:"init_timeout"`
+	RequestTimeout            string               `json:"request_timeout"`
+	WarmWorkerLimit           int                  `json:"warm_worker_limit"`
+	MaxActiveWorkers          int                  `json:"max_active_workers"`
+	WarmStartupConcurrency    int                  `json:"warm_startup_concurrency"`
+	PerAccountConcurrency     int                  `json:"per_account_concurrency"`
+	RoutingStrategy           string               `json:"routing_strategy"`
+	UpstreamChannels          []string             `json:"upstream_channels"`
+	ModelMapping              string               `json:"model_mapping"`
+	ModelChannels             string               `json:"model_channels"`
+	APIKeyAccounts            string               `json:"api_key_accounts"`
+	TemporaryChat             bool                 `json:"temporary_chat"`
+	WAABackend                string               `json:"waa_backend"`
+	MediaOutput               string               `json:"media_output"`
+	MediaBaseURL              string               `json:"media_base_url"`
+	Environment               []string             `json:"environment"`
+	Invalid                   []InvalidConfigValue `json:"invalid"`
 }
 
 // AdminCooldown 表示账户模型冷却
@@ -345,20 +361,12 @@ func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if s.config.Admin != nil {
-		status, err := s.config.Admin.Status(r.Context())
-		if err != nil {
-			writeAdminUpstreamError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, status)
-		return
-	}
-	if _, err := s.service.Models(r.Context()); err != nil {
+	status, err := s.config.Admin.Status(r.Context())
+	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ready": true})
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *server) handleAdminModels(w http.ResponseWriter, r *http.Request) {
@@ -584,11 +592,7 @@ func (s *server) handleRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 
 // handleFirstEventLatencies 返回各模型与通道近期原请求首事件等待的 p95
 func (s *server) handleFirstEventLatencies(w http.ResponseWriter, _ *http.Request) {
-	latencies := []FirstEventLatency{}
-	if provider, ok := s.config.Admin.(interface{ FirstEventLatencies() []FirstEventLatency }); ok {
-		latencies = provider.FirstEventLatencies()
-	}
-	writeJSON(w, http.StatusOK, map[string][]FirstEventLatency{"latencies": latencies})
+	writeJSON(w, http.StatusOK, map[string][]FirstEventLatency{"latencies": s.config.Admin.FirstEventLatencies()})
 }
 
 func (s *server) handleUpdateRuntimeConfig(w http.ResponseWriter, r *http.Request) {

@@ -81,7 +81,7 @@ func playgroundSchema(schema map[string]any) []any {
 // geminiSchema 把 JSON Schema 规范化为 Gemini API Schema 对象
 func geminiSchema(raw json.RawMessage) (map[string]any, error) {
 	var err error
-	raw, err = cleanJSONSchemaInput(raw)
+	raw, err = cleanSchemaInput(raw, false)
 	if err != nil {
 		return nil, err
 	}
@@ -92,9 +92,7 @@ func geminiSchema(raw json.RawMessage) (map[string]any, error) {
 		return nil, fmt.Errorf("schema false %w", errSchemaForbidsAll)
 	}
 	var schema map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
-		return nil, fmt.Errorf("schema 必须是 JSON object")
-	}
+	_ = json.Unmarshal(raw, &schema)
 	if err := normalizeConstAndMetadata(schema); err != nil {
 		return nil, err
 	}
@@ -116,9 +114,7 @@ func geminiSchema(raw json.RawMessage) (map[string]any, error) {
 		}
 		schema["items"], schema["maxItems"] = json.RawMessage("true"), json.RawMessage("0")
 	}
-	if err := normalizeImplicitType(schema); err != nil {
-		return nil, err
-	}
+	normalizeImplicitType(schema)
 	allowed := map[string]bool{
 		"type": true, "format": true, "description": true, "nullable": true,
 		"enum": true, "items": true, "properties": true, "required": true,
@@ -170,7 +166,9 @@ func geminiSchema(raw json.RawMessage) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		encoded["enum"] = values
+		if values = slices.DeleteFunc(values, func(value string) bool { return value == "" }); len(values) > 0 {
+			encoded["enum"] = values
+		}
 	}
 	if value, ok := schema["items"]; ok {
 		items, err := geminiSchema(value)
@@ -190,9 +188,7 @@ func geminiSchema(raw json.RawMessage) (map[string]any, error) {
 	}
 	if value, ok := schema["properties"]; ok {
 		var properties map[string]json.RawMessage
-		if err := json.Unmarshal(value, &properties); err != nil || properties == nil {
-			return nil, fmt.Errorf("schema.properties 必须是 JSON object")
-		}
+		_ = json.Unmarshal(value, &properties)
 		names := make([]string, 0, len(properties))
 		for name := range properties {
 			names = append(names, name)
@@ -241,9 +237,7 @@ func geminiSchema(raw json.RawMessage) (map[string]any, error) {
 	}
 	if value, ok := schema["example"]; ok {
 		var example any
-		if err := json.Unmarshal(value, &example); err != nil {
-			return nil, fmt.Errorf("schema.example 必须是 JSON value")
-		}
+		_ = json.Unmarshal(value, &example)
 		encoded["example"] = example
 	}
 	for _, name := range []string{"oneOf", "anyOf", "allOf"} {
@@ -311,22 +305,14 @@ func normalizeNullableVariants(schema map[string]json.RawMessage) error {
 			if len(nonNull) == 0 {
 				return fmt.Errorf("schema.type 必须包含非 null 类型")
 			}
-			encodedType, marshalErr := json.Marshal(nonNull[0])
-			if marshalErr != nil {
-				return marshalErr
-			}
-			schema["type"] = encodedType
+			schema["type"], _ = json.Marshal(nonNull[0])
 			if len(nonNull) > 1 {
 				delete(schema, "type")
 				variants := make([]map[string]string, 0, len(nonNull))
 				for _, name := range nonNull {
 					variants = append(variants, map[string]string{"type": name})
 				}
-				encodedVariants, marshalErr := json.Marshal(variants)
-				if marshalErr != nil {
-					return marshalErr
-				}
-				schema["anyOf"] = encodedVariants
+				schema["anyOf"], _ = json.Marshal(variants)
 			}
 			if nullable {
 				schema["nullable"] = json.RawMessage("true")
@@ -339,9 +325,7 @@ func normalizeNullableVariants(schema map[string]json.RawMessage) error {
 			continue
 		}
 		var variants []json.RawMessage
-		if err := json.Unmarshal(raw, &variants); err != nil {
-			return fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
-		}
+		_ = json.Unmarshal(raw, &variants)
 		filtered := variants[:0]
 		nullable := false
 		for _, variant := range variants {
@@ -350,9 +334,7 @@ func normalizeNullableVariants(schema map[string]json.RawMessage) error {
 				continue
 			}
 			var value map[string]json.RawMessage
-			if err := json.Unmarshal(variant, &value); err != nil || value == nil {
-				return fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
-			}
+			_ = json.Unmarshal(variant, &value)
 			typeValue, exists := value["type"]
 			if exists {
 				typeName, err := schemaString(typeValue, "type")
@@ -372,11 +354,7 @@ func normalizeNullableVariants(schema map[string]json.RawMessage) error {
 		if len(filtered) == 0 {
 			return fmt.Errorf("schema.%s 必须包含非 null 类型", name)
 		}
-		encoded, err := json.Marshal(filtered)
-		if err != nil {
-			return err
-		}
-		schema[name] = encoded
+		schema[name], _ = json.Marshal(filtered)
 		schema["nullable"] = json.RawMessage("true")
 	}
 	return nil
@@ -389,9 +367,7 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 	delete(schema, "$comment")
 	if raw, ok := schema["const"]; ok {
 		var decoded any
-		if err := json.Unmarshal(raw, &decoded); err != nil {
-			return fmt.Errorf("schema.const 必须是字符串")
-		}
+		_ = json.Unmarshal(raw, &decoded)
 		value, ok := decoded.(string)
 		if !ok {
 			return fmt.Errorf("schema.const 只支持字符串")
@@ -404,11 +380,7 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 		} else {
 			schema["type"] = json.RawMessage(`"string"`)
 		}
-		enum, err := json.Marshal([]string{value})
-		if err != nil {
-			return err
-		}
-		schema["enum"] = enum
+		schema["enum"], _ = json.Marshal([]string{value})
 		delete(schema, "const")
 	}
 	for _, name := range []string{"anyOf", "oneOf", "allOf"} {
@@ -417,38 +389,21 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 			continue
 		}
 		var variants []json.RawMessage
-		if err := json.Unmarshal(raw, &variants); err != nil {
-			return fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
-		}
+		_ = json.Unmarshal(raw, &variants)
 		for index, variant := range variants {
 			if bytes.Equal(bytes.TrimSpace(variant), []byte("true")) || bytes.Equal(bytes.TrimSpace(variant), []byte("false")) {
 				continue
 			}
 			var subSchema map[string]json.RawMessage
-			if err := json.Unmarshal(variant, &subSchema); err != nil || subSchema == nil {
-				return fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
-			}
+			_ = json.Unmarshal(variant, &subSchema)
 			if err := normalizeConstAndMetadata(subSchema); err != nil {
 				return fmt.Errorf("schema.%s[%d]: %w", name, index, err)
 			}
-			encoded, err := json.Marshal(subSchema)
-			if err != nil {
-				return err
-			}
-			variants[index] = encoded
+			variants[index], _ = json.Marshal(subSchema)
 		}
-		encoded, err := json.Marshal(variants)
-		if err != nil {
-			return err
-		}
-		schema[name] = encoded
+		schema[name], _ = json.Marshal(variants)
 	}
 	return nil
-}
-
-// cleanJSONSchemaInput 清理 Schema 可选空值并保留数据值与属性名称
-func cleanJSONSchemaInput(raw json.RawMessage) (json.RawMessage, error) {
-	return cleanSchemaInput(raw, false)
 }
 
 // cleanSchemaInput 清理可选空值并按工具与输出约束保留组合节点
@@ -566,6 +521,17 @@ func normalizeNotSchema(schema map[string]json.RawMessage) error {
 			delete(schema, "not")
 			schema["nullable"] = json.RawMessage("false")
 		}
+		var values []string
+		if json.Unmarshal(sub["enum"], &values) == nil && slices.Contains(values, "") {
+			subType, _ := schemaType(sub)
+			pure := len(sub) == 1 || len(sub) == 2 && strings.EqualFold(subType, "string")
+			if values = excludeEmptyString(schema, values, pure); len(values) == 0 {
+				delete(schema, "not")
+				return nil
+			}
+			sub["enum"], _ = json.Marshal(values)
+			schema["not"], _ = json.Marshal(sub)
+		}
 		return nil
 	}
 	var values []string
@@ -576,7 +542,7 @@ func normalizeNotSchema(schema map[string]json.RawMessage) error {
 		}
 		values = []string{value}
 	}
-	if len(values) == 0 {
+	if values = excludeEmptyString(schema, values, true); len(values) == 0 {
 		delete(schema, "not")
 		return nil
 	}
@@ -584,8 +550,21 @@ func normalizeNotSchema(schema map[string]json.RawMessage) error {
 	return nil
 }
 
+// excludeEmptyString 去掉排除值中上游拒绝的空串，pure 表示 not 只是纯枚举排除，此时字符串节点改写为 minLength 1；返回其余排除值
+func excludeEmptyString(schema map[string]json.RawMessage, values []string, pure bool) []string {
+	if !slices.Contains(values, "") {
+		return values
+	}
+	typeName, _ := schemaType(schema)
+	var minLength int
+	if pure && strings.EqualFold(typeName, "string") && (json.Unmarshal(schema["minLength"], &minLength) != nil || minLength < 1) {
+		schema["minLength"] = json.RawMessage("1")
+	}
+	return slices.DeleteFunc(values, func(value string) bool { return value == "" })
+}
+
 // normalizeImplicitType 从节点约束推导类型并保留开放的数组元素
-func normalizeImplicitType(schema map[string]json.RawMessage) error {
+func normalizeImplicitType(schema map[string]json.RawMessage) {
 	if _, ok := schema["type"]; !ok {
 		var typed map[string]json.RawMessage
 		conflictingType, conflictingItems := false, false
@@ -623,7 +602,7 @@ func normalizeImplicitType(schema map[string]json.RawMessage) error {
 	}
 	var typeName string
 	if json.Unmarshal(schema["type"], &typeName) != nil || !strings.EqualFold(typeName, "array") || schema["items"] != nil {
-		return nil
+		return
 	}
 	schema["items"] = json.RawMessage(`true`)
 	var prefix []map[string]json.RawMessage
@@ -635,14 +614,9 @@ func normalizeImplicitType(schema map[string]json.RawMessage) error {
 			}
 		}
 		if len(typed) > 0 {
-			encoded, err := json.Marshal(map[string]any{"anyOf": typed})
-			if err != nil {
-				return err
-			}
-			schema["items"] = encoded
+			schema["items"], _ = json.Marshal(map[string]any{"anyOf": typed})
 		}
 	}
-	return nil
 }
 
 func schemaType(schema map[string]json.RawMessage) (string, error) {
@@ -691,9 +665,7 @@ func schemaNumber(raw json.RawMessage, name string) (float64, error) {
 
 func encodeSchemaVariants(raw json.RawMessage, name string) ([]any, error) {
 	var variants []json.RawMessage
-	if err := json.Unmarshal(raw, &variants); err != nil {
-		return nil, fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
-	}
+	_ = json.Unmarshal(raw, &variants)
 	encoded := make([]any, 0, len(variants))
 	for index, variant := range variants {
 		schema, err := geminiSchema(variant)
@@ -738,10 +710,7 @@ func normalizeFunctionParameters(raw json.RawMessage) (json.RawMessage, error) {
 	if bytes.Equal(cleaned, []byte("{}")) || bytes.Equal(cleaned, []byte("true")) {
 		return json.RawMessage(`{"type":"object"}`), nil
 	}
-	schema, err := decodeSchemaValue(cleaned)
-	if err != nil {
-		return nil, err
-	}
+	schema := decodeSchemaValue(cleaned)
 	if !defineRequiredProperties(schema) {
 		return cleaned, nil
 	}
@@ -749,14 +718,12 @@ func normalizeFunctionParameters(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 // decodeSchemaValue 解码 Schema 并保留数值原文
-func decodeSchemaValue(raw json.RawMessage) (any, error) {
+func decodeSchemaValue(raw json.RawMessage) any {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return nil, err
-	}
-	return value, nil
+	_ = decoder.Decode(&value)
+	return value
 }
 
 // defineRequiredProperties 为 required 列出而 properties 未定义的属性补充不限类型的定义，返回是否修改
@@ -805,15 +772,14 @@ func defineRequiredProperties(value any) bool {
 	return changed
 }
 
-// inlineSchemaRefs 把指向根 $defs 或 definitions 的本地 $ref 替换为被引用的定义，循环引用保留原节点
-func inlineSchemaRefs(raw json.RawMessage) (json.RawMessage, error) {
-	value, err := decodeSchemaValue(raw)
-	if err != nil {
-		return nil, err
-	}
-	root, ok := value.(map[string]any)
+// maxSchemaRefExpansions 为一个 Schema 中展开本地 $ref 的总次数上限
+const maxSchemaRefExpansions = 500
+
+// inlineSchemaRefs 把指向根 $defs 或 definitions 的本地 $ref 替换为被引用的定义，循环引用与超过 maxSchemaRefExpansions 之后的引用保留原节点
+func inlineSchemaRefs(raw json.RawMessage) json.RawMessage {
+	root, ok := decodeSchemaValue(raw).(map[string]any)
 	if !ok {
-		return raw, nil
+		return raw
 	}
 	definitions := map[string]any{}
 	for _, key := range []string{"$defs", "definitions"} {
@@ -824,29 +790,32 @@ func inlineSchemaRefs(raw json.RawMessage) (json.RawMessage, error) {
 		}
 	}
 	if len(definitions) == 0 {
-		return raw, nil
+		return raw
 	}
-	resolved := resolveSchemaRefs(root, definitions, nil).(map[string]any)
+	budget := maxSchemaRefExpansions
+	resolved := resolveSchemaRefs(root, definitions, nil, &budget).(map[string]any)
 	delete(resolved, "$defs")
 	delete(resolved, "definitions")
-	return json.Marshal(resolved)
+	encoded, _ := json.Marshal(resolved)
+	return encoded
 }
 
-// resolveSchemaRefs 递归替换本地 $ref，节点自身的其他字段优先于被引用定义的同名字段
-func resolveSchemaRefs(value any, definitions map[string]any, active []string) any {
+// resolveSchemaRefs 递归替换本地 $ref，节点自身的其他字段优先于被引用定义的同名字段，budget 为剩余的展开次数
+func resolveSchemaRefs(value any, definitions map[string]any, active []string, budget *int) any {
 	switch node := value.(type) {
 	case map[string]any:
 		if ref, ok := node["$ref"].(string); ok {
-			if definition, ok := definitions[ref]; ok && !slices.Contains(active, ref) {
+			if definition, ok := definitions[ref]; ok && !slices.Contains(active, ref) && *budget > 0 {
+				*budget--
 				merged := map[string]any{}
-				if target, ok := resolveSchemaRefs(definition, definitions, append(slices.Clip(active), ref)).(map[string]any); ok {
+				if target, ok := resolveSchemaRefs(definition, definitions, append(slices.Clip(active), ref), budget).(map[string]any); ok {
 					for key, item := range target {
 						merged[key] = item
 					}
 				}
 				for key, item := range node {
 					if key != "$ref" {
-						merged[key] = resolveSchemaRefs(item, definitions, active)
+						merged[key] = resolveSchemaRefs(item, definitions, active, budget)
 					}
 				}
 				return merged
@@ -854,13 +823,13 @@ func resolveSchemaRefs(value any, definitions map[string]any, active []string) a
 		}
 		result := make(map[string]any, len(node))
 		for key, item := range node {
-			result[key] = resolveSchemaRefs(item, definitions, active)
+			result[key] = resolveSchemaRefs(item, definitions, active, budget)
 		}
 		return result
 	case []any:
 		result := make([]any, len(node))
 		for index, item := range node {
-			result[index] = resolveSchemaRefs(item, definitions, active)
+			result[index] = resolveSchemaRefs(item, definitions, active, budget)
 		}
 		return result
 	}
@@ -874,6 +843,10 @@ const responseSchemaNote = "The response must follow this JSON Schema: "
 func encodeResponseSchema(raw json.RawMessage) (map[string]any, error) {
 	encoded, err := geminiSchema(raw)
 	if err == nil {
+		if schemaHasEmptyEnum(raw) {
+			description, _ := encoded["description"].(string)
+			encoded["description"] = describedSchema(description, raw)
+		}
 		return encoded, nil
 	}
 	if errors.Is(err, errSchemaForbidsAll) {
@@ -886,11 +859,8 @@ func encodeResponseSchema(raw json.RawMessage) (map[string]any, error) {
 	if _, ok := schema.(map[string]any); !ok {
 		return nil, err
 	}
-	shape, shapeErr := json.Marshal(toolSchemaShape(schema))
-	if shapeErr != nil {
-		return nil, err
-	}
-	encoded, shapeErr = geminiSchema(shape)
+	shape, _ := json.Marshal(toolSchemaShape(schema))
+	encoded, shapeErr := geminiSchema(shape)
 	if shapeErr != nil {
 		return nil, err
 	}
@@ -899,16 +869,37 @@ func encodeResponseSchema(raw json.RawMessage) (map[string]any, error) {
 	return encoded, nil
 }
 
+// schemaHasEmptyEnum 判断 Schema 的 enum 含上游拒绝的空串，编码时去掉空串并在说明附完整 Schema
+func schemaHasEmptyEnum(raw json.RawMessage) bool {
+	return slices.ContainsFunc(schemaEnums(decodeSchemaValue(raw)), func(values []any) bool { return slices.Contains(values, any("")) })
+}
+
+// schemaEnums 返回 Schema 各层节点的 enum 取值
+func schemaEnums(value any) [][]any {
+	var enums [][]any
+	switch node := value.(type) {
+	case map[string]any:
+		if values, ok := node["enum"].([]any); ok {
+			enums = append(enums, values)
+		}
+		for _, item := range node {
+			enums = append(enums, schemaEnums(item)...)
+		}
+	case []any:
+		for _, item := range node {
+			enums = append(enums, schemaEnums(item)...)
+		}
+	}
+	return enums
+}
+
 // describedSchema 返回附加完整 JSON Schema 后的说明，已附加时原样返回
 func describedSchema(description string, raw json.RawMessage) string {
 	if strings.Contains(description, responseSchemaNote) {
 		return description
 	}
 	var compact bytes.Buffer
-	if json.Compact(&compact, raw) != nil {
-		compact.Reset()
-		compact.Write(raw)
-	}
+	_ = json.Compact(&compact, raw)
 	return strings.TrimSpace(description + "\n" + responseSchemaNote + compact.String())
 }
 
@@ -945,9 +936,7 @@ func RequestBuildOnly(request GenerateRequest) bool {
 // jsonSchemaBeyondPlayground 查找 Playground Schema 没有对应字段的 JSON Schema 约束
 func jsonSchemaBeyondPlayground(raw json.RawMessage) bool {
 	var node any
-	if json.Unmarshal(raw, &node) != nil {
-		return false
-	}
+	_ = json.Unmarshal(raw, &node)
 	var walk func(any) bool
 	walk = func(value any) bool {
 		switch typed := value.(type) {
